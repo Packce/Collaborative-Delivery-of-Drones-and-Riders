@@ -148,6 +148,12 @@ class UAVPathCostCalculator:
         k_nearest: int = 4,
         ignore_first_collision: bool = True,
         ignore_last_collision: bool = True,
+        customers: Optional[List[Dict[str, Any]]] = None,
+        candidate_points: Optional[List[Tuple[float, float]]] = None,
+        merchants: Optional[List[Dict[str, Any]]] = None,
+        c_delivery: float = 1.0,
+        rider_speed: float = 15.0,
+        drone_speed: float = 50.0,
     ):
         """初始化路径代价计算器。
 
@@ -161,6 +167,12 @@ class UAVPathCostCalculator:
             k_nearest: 每个路径点仅评估最近的 k 个障碍物，用于提速
             ignore_first_collision: 是否忽略全路径的第一次碰撞惩罚
             ignore_last_collision: 是否忽略全路径的最后一次碰撞惩罚
+            customers: 顾客数据列表，每项包含 x, y 坐标
+            candidate_points: 候选点坐标列表，用于计算配送时间
+            merchants: 商家数据列表，每项包含 x, y 坐标
+            c_delivery: 配送时间代价权重系数
+            rider_speed: 骑手平均速度（km/h），默认15km/h
+            drone_speed: 无人机平均速度（km/h），默认50km/h
         """
 
         self.terrain = terrain
@@ -172,6 +184,12 @@ class UAVPathCostCalculator:
         self.k_nearest = max(1, int(k_nearest))
         self.ignore_first_collision = bool(ignore_first_collision)
         self.ignore_last_collision = bool(ignore_last_collision)
+        self.customers = customers if customers is not None else []
+        self.candidate_points = candidate_points if candidate_points is not None else []
+        self.merchants = merchants if merchants is not None else []
+        self.c_delivery = c_delivery
+        self.rider_speed = rider_speed
+        self.drone_speed = drone_speed
 
         if obstacles:
             self._obs_x = np.array([obs.x for obs in obstacles], dtype=float)
@@ -444,6 +462,113 @@ class UAVPathCostCalculator:
 
         return float(total_angle_change * self.c_theta)
 
+    def rider_time_cost(
+        self,
+        path: List[Tuple[float, float, float]],
+    ) -> float:
+        """计算从候选点到顾客的配送时间代价。
+
+        参数:
+            path: 中间路径点列表（候选点路径）
+
+        返回:
+            所有顾客到其最近候选点的配送时间之和（小时），乘以权重系数 c_delivery。
+
+        说明:
+            - 只考虑 x, y 坐标的距离
+            - 配送时间 = 距离 / 骑手平均速度（rider_speed，单位km/h）
+            - 距离单位是米，需要除以1000转换为公里
+        """
+        if not self.customers or not self.candidate_points:
+            return 0.0
+
+        total_delivery_time = 0.0
+        speed_km_per_h = self.rider_speed
+
+        for customer in self.customers:
+            cx, cy = customer.get('x', 0.0), customer.get('y', 0.0)
+
+            min_distance = float('inf')
+            for candidate in self.candidate_points:
+                px, py = candidate[0], candidate[1]
+                dist = sqrt((cx - px) ** 2 + (cy - py) ** 2)
+                if dist < min_distance:
+                    min_distance = dist
+
+            delivery_time_hours = (min_distance / 1000.0) / speed_km_per_h
+            total_delivery_time += delivery_time_hours
+
+        return float(total_delivery_time * self.c_delivery)
+
+    def drone_time_cost(
+        self,
+        path: List[Tuple[float, float, float]],
+        start: Tuple[float, float, float],
+        end: Tuple[float, float, float],
+    ) -> float:
+        """计算无人机构建时间代价（未乘权重）。
+
+        参数:
+            path: 中间路径点列表（候选点路径）
+            start: 起点（商家位置）
+            end: 终点
+
+        返回:
+            无人机从商家到候选点的飞行时间（小时）。
+
+        说明:
+            - 距离计算包含 x, y, z 三个坐标
+            - 使用无人机速度 uav_speed（km/h）
+            - 距离单位是米，需要除以1000转换为公里
+        """
+        if not self.merchants or not path:
+            return 0.0
+
+        merchant = self.merchants[0]
+        mx, my = merchant.get('x', 0.0), merchant.get('y', 0.0)
+        mz = self.terrain.get_elevation(mx, my)
+
+        first_point = path[0]
+        px, py, pz = first_point[0], first_point[1], first_point[2]
+
+        dist_3d = sqrt((mx - px) ** 2 + (my - py) ** 2 + (mz - pz) ** 2)
+        drone_time_hours = (dist_3d / 1000.0) / self.drone_speed
+
+        return float(drone_time_hours) 
+
+    def total_time(
+        self,
+        path: List[Tuple[float, float, float]],
+        start: Tuple[float, float, float],
+        end: Tuple[float, float, float],
+    ) -> float:
+        """计算总时间（无人机运送时间 + 骑手配送时间）。
+
+        参数:
+            path: 中间路径点列表（候选点路径）
+            start: 起点（商家位置）
+            end: 终点
+
+        返回:
+            总时间（小时）= 无人机飞行时间 + 骑手配送时间。
+        """
+        drone_time = self.drone_time_cost(path, start, end)
+
+        rider_time = 0.0
+        if self.customers and self.candidate_points:
+            speed_km_per_h = self.rider_speed
+            for customer in self.customers:
+                cx, cy = customer.get('x', 0.0), customer.get('y', 0.0)
+                min_distance = float('inf')
+                for candidate in self.candidate_points:
+                    px, py = candidate[0], candidate[1]
+                    dist = sqrt((cx - px) ** 2 + (cy - py) ** 2)
+                    if dist < min_distance:
+                        min_distance = dist
+                rider_time += (min_distance / 1000.0) / speed_km_per_h
+
+        return float(drone_time + rider_time)
+
     def total_cost(
         self,
         path: List[Tuple[float, float, float]],
@@ -458,7 +583,7 @@ class UAVPathCostCalculator:
             end: 终点
 
         返回:
-            地形代价 + 障碍物代价 + 路程代价 + 高度变化代价 + 转角代价。
+            地形代价 + 障碍物代价 + 路程代价 + 高度变化代价 + 转角代价 + 配送时间代价。
         """
 
         tc = self.terrain_cost(path)
@@ -466,7 +591,8 @@ class UAVPathCostCalculator:
         fc = self.flight_distance_cost(path, start, end)
         ac = self.altitude_variation_cost(path, start, end)
         angc = self.turning_angle_cost(path, start, end)
-        return float(tc + oc + fc + ac + angc)
+        rc = self.rider_time_cost(path)
+        return float(tc + oc + fc + ac + angc + rc)
 
 
 def _ensure_required_columns(
@@ -669,7 +795,9 @@ def _default_data_paths() -> Tuple[Path, Path]:
     data_dir = project_root / "数据"
     terrain_csv = data_dir / "投影加剪裁后的地形高度数据.csv"
     building_csv = data_dir / "裁剪后的建筑物数据_简洁版.csv"
-    return terrain_csv, building_csv
+    candidate_csv = data_dir / "候选点_适中.csv"
+    
+    return terrain_csv, building_csv, cluster_csv, candidate_csv
 
 
 def main() -> None:
@@ -758,6 +886,140 @@ def main() -> None:
         total = calculator.total_cost(test_path, start_point, end_point)
         print("Fallback to demo data.")
         print(f"Total cost: {total:.2f}")
+
+
+def select_random_merchants(
+    csv_path: str,
+    n: int,
+    random_seed: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """从商家数据CSV中随机抽取n个商家作为模型起点。
+
+    参数:
+        csv_path: 商家数据CSV文件路径
+        n: 抽取的商家数量
+        random_seed: 随机种子，用于复现结果
+
+    返回:
+        包含商家信息的字典列表，每条记录包含:
+        - id: 商家ID
+        - name: 商家名称
+        - address: 商家地址
+        - phone: 商家电话
+        - x: Center_X 投影坐标
+        - y: Center_Y 投影坐标
+        - longitude: 经度_GCJ02
+        - latitude: 纬度_GCJ02
+        - type_code: 类型代码
+        - type_name: 类型名称
+        - rating: 评分
+
+    异常:
+        ValueError: 当 n 大于CSV总行数时抛出
+    """
+    if random_seed is not None:
+        np.random.seed(random_seed)
+
+    rows = []
+    with open(csv_path, newline='', encoding='utf-8-sig') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rows.append(row)
+
+    if n > len(rows):
+        raise ValueError(f"Requested {n} merchants but only {len(rows)} available in CSV")
+
+    selected_indices = np.random.choice(len(rows), size=n, replace=False)
+
+    result = []
+    for idx in selected_indices:
+        row = rows[idx]
+        x_str = row.get('Center_X', '0')
+        y_str = row.get('Center_Y', '0')
+        rating_str = row.get('评分', '')
+
+        result.append({
+            'id': row.get('id', ''),
+            'name': row.get('名称', ''),
+            'address': row.get('地址', ''),
+            'phone': row.get('电话', ''),
+            'x': float(x_str) if x_str else 0.0,
+            'y': float(y_str) if y_str else 0.0,
+            'longitude': row.get('经度_GCJ02', ''),
+            'latitude': row.get('纬度_GCJ02', ''),
+            'type_code': row.get('类型代码', ''),
+            'type_name': row.get('类型名称', ''),
+            'rating': float(rating_str) if rating_str and rating_str != '[]' else None,
+        })
+
+    return result
+
+
+def select_random_customers(
+    csv_path: str,
+    m: int,
+    random_seed: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """从顾客数据CSV中随机抽取m个顾客。
+
+    参数:
+        csv_path: 顾客数据CSV文件路径
+        m: 抽取的顾客数量
+        random_seed: 随机种子，用于复现结果
+
+    返回:
+        包含顾客信息的字典列表，每条记录包含:
+        - id: 顾客ID
+        - name: 顾客名称
+        - address: 顾客地址
+        - phone: 顾客电话
+        - x: Center_X 投影坐标
+        - y: Center_Y 投影坐标
+        - longitude: 经度_GCJ02
+        - latitude: 纬度_GCJ02
+        - type_code: 类型代码
+        - type_name: 类型名称
+        - rating: 评分
+
+    异常:
+        ValueError: 当 m 大于CSV总行数时抛出
+    """
+    if random_seed is not None:
+        np.random.seed(random_seed)
+
+    rows = []
+    with open(csv_path, newline='', encoding='utf-8-sig') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rows.append(row)
+
+    if m > len(rows):
+        raise ValueError(f"Requested {m} customers but only {len(rows)} available in CSV")
+
+    selected_indices = np.random.choice(len(rows), size=m, replace=False)
+
+    result = []
+    for idx in selected_indices:
+        row = rows[idx]
+        x_str = row.get('Center_X', '0')
+        y_str = row.get('Center_Y', '0')
+        rating_str = row.get('评分', '')
+
+        result.append({
+            'id': row.get('id', ''),
+            'name': row.get('名称', ''),
+            'address': row.get('地址', ''),
+            'phone': row.get('电话', ''),
+            'x': float(x_str) if x_str else 0.0,
+            'y': float(y_str) if y_str else 0.0,
+            'longitude': row.get('经度_GCJ02', ''),
+            'latitude': row.get('纬度_GCJ02', ''),
+            'type_code': row.get('类型代码', ''),
+            'type_name': row.get('类型名称', ''),
+            'rating': float(rating_str) if rating_str and rating_str != '[]' else None,
+        })
+
+    return result
 
 
 if __name__ == "__main__":

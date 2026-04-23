@@ -7,15 +7,15 @@ from sklearn.preprocessing import StandardScaler
 from scipy.spatial.distance import pdist, squareform
 
 # ================== 配置参数 ==================
-DATA_PATH = "D:\文档\大学文件\竞赛\统计建模\真正的统模\代码和数据\数据\重庆POI数据_带人口密度.csv"
-MIN_CLUSTER_SIZE = 10               # 最小簇大小
-MIN_SAMPLES = 3                     # 密度估计参数
+DATA_PATH = "D:\文档\大学文件\竞赛\统计建模\真正的统模\代码和数据\数据\顾客数据_带人口密度.csv"
+MIN_CLUSTER_SIZE = 18               # 最小簇大小
+MIN_SAMPLES = 9                     # 密度估计参数
 USE_POP_DENSITY = True              # 是否将人口密度作为聚类特征
 POP_DENSITY_WEIGHT = 2.0            # 人口密度权重，值越大人口密度影响越大
 CENTER_WEIGHT = 0.6      # 密度中心权重（距离倒数的权重）
 DENSITY_WEIGHT = 0.4     # 人口密度权重
-OUTPUT_CSV = "聚类结果_适中.csv"
-OUTPUT_PLOT = "聚类结果_适中.png"
+OUTPUT_CSV = "D:\文档\大学文件\竞赛\统计建模\真正的统模\代码和数据\数据处理\聚类结果_适中.csv"
+OUTPUT_PLOT = "D:\文档\大学文件\竞赛\统计建模\真正的统模\代码和数据\数据处理\聚类结果_适中.png"
 
 # ================== 读取数据 ==================
 df = pd.read_csv(DATA_PATH)
@@ -164,5 +164,5 @@ print(f"聚类图已保存至: {OUTPUT_PLOT}")
 df.to_csv(OUTPUT_CSV, index=False, encoding='utf-8-sig')
 print(f"聚类结果已保存至: {OUTPUT_CSV}")
 
-candidate_df.to_csv("候选点_适中.csv", index=False, encoding='utf-8-sig')
-print("候选点列表已保存至: 候选点_适中.csv")
+candidate_df.to_csv("D:\文档\大学文件\竞赛\统计建模\真正的统模\代码和数据\数据处理\候选点_适中.csv", index=False, encoding='utf-8-sig')
+print("候选点列表已保存至: D:\文档\大学文件\竞赛\统计建模\真正的统模\代码和数据\数据处理\候选点_适中.csv")

@@ -464,22 +464,31 @@ class UAVPathCostCalculator:
 
     def rider_time_cost(
         self,
-        path: List[Tuple[float, float, float]],
+        paths: List[List[Tuple[float, float, float]]],
     ) -> float:
         """计算从候选点到顾客的配送时间代价。
 
         参数:
-            path: 中间路径点列表（候选点路径）
+            paths: 路径列表，paths[i] 对应 merchants[i] 到候选点的路径，
+                   路径的终点被视为服务候选点
 
         返回:
-            所有顾客到其最近候选点的配送时间之和（小时），乘以权重系数 c_delivery。
+            所有顾客到其最近服务候选点的配送时间之和（小时），乘以权重系数 c_delivery。
 
         说明:
             - 只考虑 x, y 坐标的距离
             - 配送时间 = 距离 / 骑手平均速度（rider_speed，单位km/h）
             - 距离单位是米，需要除以1000转换为公里
         """
-        if not self.customers or not self.candidate_points:
+        if not self.customers or not paths:
+            return 0.0
+
+        service_points = []
+        for path in paths:
+            if path:
+                service_points.append((path[-1][0], path[-1][1]))
+
+        if not service_points:
             return 0.0
 
         total_delivery_time = 0.0
@@ -489,8 +498,7 @@ class UAVPathCostCalculator:
             cx, cy = customer.get('x', 0.0), customer.get('y', 0.0)
 
             min_distance = float('inf')
-            for candidate in self.candidate_points:
-                px, py = candidate[0], candidate[1]
+            for px, py in service_points:
                 dist = sqrt((cx - px) ** 2 + (cy - py) ** 2)
                 if dist < min_distance:
                     min_distance = dist
@@ -503,28 +511,25 @@ class UAVPathCostCalculator:
     def drone_time_cost(
         self,
         path: List[Tuple[float, float, float]],
-        start: Tuple[float, float, float],
-        end: Tuple[float, float, float],
+        merchant: Dict[str, Any],
     ) -> float:
-        """计算无人机构建时间代价（未乘权重）。
+        """计算单个商家到其候选点的无人机构建时间（未乘权重）。
 
         参数:
-            path: 中间路径点列表（候选点路径）
-            start: 起点（商家位置）
-            end: 终点
+            path: 该商家到候选点的中间路径点列表
+            merchant: 商家信息字典，包含 x, y 坐标
 
         返回:
-            无人机从商家到候选点的飞行时间（小时）。
+            该商家无人机到候选点的飞行时间（小时）。
 
         说明:
             - 距离计算包含 x, y, z 三个坐标
-            - 使用无人机速度 uav_speed（km/h）
+            - 使用无人机速度 drone_speed（km/h）
             - 距离单位是米，需要除以1000转换为公里
         """
-        if not self.merchants or not path:
+        if not path:
             return 0.0
 
-        merchant = self.merchants[0]
         mx, my = merchant.get('x', 0.0), merchant.get('y', 0.0)
         mz = self.terrain.get_elevation(mx, my)
 
@@ -534,25 +539,42 @@ class UAVPathCostCalculator:
         dist_3d = sqrt((mx - px) ** 2 + (my - py) ** 2 + (mz - pz) ** 2)
         drone_time_hours = (dist_3d / 1000.0) / self.drone_speed
 
-        return float(drone_time_hours) 
+        return float(drone_time_hours)
+
+    def total_drone_time(
+        self,
+        paths: List[List[Tuple[float, float, float]]],
+    ) -> float:
+        """计算所有商家的无人机构建时间总和。
+
+        参数:
+            paths: 路径列表，paths[i] 对应 merchants[i] 的路径
+
+        返回:
+            所有商家无人机飞行时间之和（小时）。
+        """
+        if not self.merchants or not paths:
+            return 0.0
+
+        total_time = 0.0
+        for i, path in enumerate(paths):
+            if i < len(self.merchants):
+                total_time += self.drone_time_cost(path, self.merchants[i])
+        return float(total_time)
 
     def total_time(
         self,
-        path: List[Tuple[float, float, float]],
-        start: Tuple[float, float, float],
-        end: Tuple[float, float, float],
+        paths: List[List[Tuple[float, float, float]]],
     ) -> float:
-        """计算总时间（无人机运送时间 + 骑手配送时间）。
+        """计算总时间（所有商家无人机运送时间 + 骑手配送时间）。
 
         参数:
-            path: 中间路径点列表（候选点路径）
-            start: 起点（商家位置）
-            end: 终点
+            paths: 路径列表，paths[i] 对应 merchants[i] 的路径
 
         返回:
-            总时间（小时）= 无人机飞行时间 + 骑手配送时间。
+            总时间（小时）= Σ(每商家无人机飞行时间) + 骑手配送时间。
         """
-        drone_time = self.drone_time_cost(path, start, end)
+        drone_time = self.total_drone_time(paths)
 
         rider_time = 0.0
         if self.customers and self.candidate_points:
@@ -571,28 +593,40 @@ class UAVPathCostCalculator:
 
     def total_cost(
         self,
-        path: List[Tuple[float, float, float]],
-        start: Tuple[float, float, float],
-        end: Tuple[float, float, float],
+        paths: List[List[Tuple[float, float, float]]],
     ) -> float:
-        """计算路径总成本。
+        """计算所有路径的总成本。
 
         参数:
-            path: 中间路径点列表
-            start: 起点
-            end: 终点
+            paths: 路径列表，paths[i] 对应 merchants[i] 到候选点的路径
 
         返回:
-            地形代价 + 障碍物代价 + 路程代价 + 高度变化代价 + 转角代价 + 配送时间代价。
+            Σ(每条路径的: 地形代价 + 障碍物代价 + 路程代价 + 高度变化代价 + 转角代价) + 配送时间代价。
         """
+        if not paths:
+            return 0.0
 
-        tc = self.terrain_cost(path)
-        oc = self.obstacle_collision_cost(path, start, end)
-        fc = self.flight_distance_cost(path, start, end)
-        ac = self.altitude_variation_cost(path, start, end)
-        angc = self.turning_angle_cost(path, start, end)
-        rc = self.rider_time_cost(path)
-        return float(tc + oc + fc + ac + angc + rc)
+        total = 0.0
+        for i, path in enumerate(paths):
+            if i >= len(self.merchants):
+                break
+
+            merchant = self.merchants[i]
+            mx, my = merchant.get('x', 0.0), merchant.get('y', 0.0)
+            mz = self.terrain.get_elevation(mx, my)
+
+            start = (mx, my, mz)
+            end = (path[-1][0], path[-1][1], path[-1][2]) if path else start
+
+            tc = self.terrain_cost(path)
+            oc = self.obstacle_collision_cost(path, start, end)
+            fc = self.flight_distance_cost(path, start, end)
+            ac = self.altitude_variation_cost(path, start, end)
+            angc = self.turning_angle_cost(path, start, end)
+            total += tc + oc + fc + ac + angc
+
+        rc = self.rider_time_cost(paths)
+        return float(total + rc)
 
 
 def _ensure_required_columns(
@@ -834,63 +868,34 @@ def main() -> None:
     逻辑:
         1. 若默认数据文件存在，则加载真实数据并计算示例路径代价。
         2. 否则回退到随机模拟数据，保证脚本可独立运行。
+
+    说明:
+        当前演示使用多商家到候选点的路径结构:
+        - merchants: 商家列表
+        - paths: 路径列表，paths[i] 对应 merchants[i] 到候选点的飞行路径
+        - 每个路径的终点被视为该商家的服务候选点
+        - rider_time_cost 基于所有商家的服务候选点计算
     """
 
     terrain_csv, building_csv, candidate_csv = _default_data_paths()
 
-    if terrain_csv.exists() and building_csv.exists() and candidate_csv.exists():   
-        calculator = build_calculator_from_csv(
-            terrain_csv_path=str(terrain_csv),
-            building_csv_path=str(building_csv),
-            candidate_csv_path=str(candidate_csv),
-            c_T=1000.0,
-            c_B=100.0,
-            c_hr=20.0,
-            c_theta=20.0 / pi,
-            k_nearest=4,
-        )
-
-        candidates = calculator.candidate_points
-        terrain = calculator.terrain
-        obstacles = calculator.obstacles
-
-        x_span = terrain.x_max - terrain.x_min
-        y_span = terrain.y_max - terrain.y_min
-
-        start_xy = (terrain.x_min + 0.1 * x_span, terrain.y_min + 0.1 * y_span)
-        end_xy = (terrain.x_min + 0.9 * x_span, terrain.y_min + 0.9 * y_span)
-
-        start = (
-            start_xy[0],
-            start_xy[1],
-            terrain.get_elevation(start_xy[0], start_xy[1]) + 90.0,
-        )
-        end = (
-            end_xy[0],
-            end_xy[1],
-            terrain.get_elevation(end_xy[0], end_xy[1]) + 90.0,
-        )
-
-        path = []
-        for t in (0.25, 0.45, 0.65, 0.8):
-            x = start[0] + t * (end[0] - start[0])
-            y = start[1] + t * (end[1] - start[1])
-            h = terrain.get_elevation(x, y) + 95.0 + 10.0 * np.sin(t * pi)
-            path.append((x, y, float(h)))
-
-        total = calculator.total_cost(path, start, end)
+    if terrain_csv.exists() and building_csv.exists() and candidate_csv.exists():
+        terrain = load_terrain_from_csv(str(terrain_csv))
+        obstacles = load_obstacles_from_csv(str(building_csv))
+        candidate_points = load_candidates_from_csv(str(candidate_csv))
 
         print("Loaded real dataset successfully.")
         print(f"Terrain grid: {terrain.ny} x {terrain.nx}")
         print(f"Obstacle count: {len(obstacles)}")
+        print(f"Candidate points count: {len(candidate_points)}")
         print(f"X range: [{terrain.x_min:.3f}, {terrain.x_max:.3f}]")
         print(f"Y range: [{terrain.y_min:.3f}, {terrain.y_max:.3f}]")
-        print(f"Total cost: {total:.2f}")
-        print(f"Terrain cost: {calculator.terrain_cost(path):.2f}")
-        print(f"Obstacle cost: {calculator.obstacle_collision_cost(path, start, end):.2f}")
-        print(f"Distance cost: {calculator.flight_distance_cost(path, start, end):.2f}")
-        print(f"Altitude cost: {calculator.altitude_variation_cost(path, start, end):.2f}")
-        print(f"Turning cost: {calculator.turning_angle_cost(path, start, end):.2f}")
+        print()
+        print("Note: 真实路径规划需要:")
+        print("  1. 使用 select_random_merchants() 选择商家")
+        print("  2. 使用 select_random_customers() 选择顾客")
+        print("  3. 优化算法生成 paths (List[List[Tuple[float,float,float]]])")
+        print("  4. 调用 calculator.total_cost(paths) 评估代价")
     else:
         np.random.seed(42)
         demo_elevation = np.random.uniform(0, 50, size=(128, 128))
@@ -902,20 +907,38 @@ def main() -> None:
             Obstacle(x=800, y=700, z=20, r=20),
         ]
 
-        calculator = UAVPathCostCalculator(terrain, obstacles)
-
-        start_point = (100.0, 100.0, 60.0)
-        end_point = (900.0, 900.0, 55.0)
-        test_path = [
-            (200.0, 200.0, 70.0),
-            (350.0, 400.0, 80.0),
-            (500.0, 300.0, 75.0),
-            (700.0, 600.0, 90.0),
+        merchants = [
+            {'name': 'DemoMerchant1', 'x': 100.0, 'y': 100.0},
+            {'name': 'DemoMerchant2', 'x': 500.0, 'y': 200.0},
+        ]
+        customers = [
+            {'name': 'Customer1', 'x': 200.0, 'y': 150.0},
+            {'name': 'Customer2', 'x': 400.0, 'y': 350.0},
+            {'name': 'Customer3', 'x': 700.0, 'y': 600.0},
         ]
 
-        total = calculator.total_cost(test_path, start_point, end_point)
+        calculator = UAVPathCostCalculator(
+            terrain, obstacles,
+            merchants=merchants,
+            customers=customers,
+            c_delivery=1.0,
+            rider_speed=15.0,
+            drone_speed=50.0,
+        )
+
+        paths = [
+            [(200.0, 200.0, 70.0), (350.0, 400.0, 80.0)],
+            [(600.0, 300.0, 75.0), (700.0, 500.0, 85.0)],
+        ]
+
+        total_cost = calculator.total_cost(paths)
+        total_time = calculator.total_time(paths)
+
         print("Fallback to demo data.")
-        print(f"Total cost: {total:.2f}")
+        print(f"Merchant count: {len(merchants)}")
+        print(f"Customer count: {len(customers)}")
+        print(f"Total cost: {total_cost:.2f}")
+        print(f"Total time: {total_time:.4f} hours")
 
 
 def select_random_merchants(

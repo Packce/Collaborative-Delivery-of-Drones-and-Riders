@@ -767,9 +767,34 @@ def load_obstacles_from_csv(csv_path: str, min_radius: float = 0.0) -> List[Obst
     return obstacles
 
 
+def load_candidates_from_csv(csv_path: str) -> List[Tuple[float, float]]:
+    """从候选点 CSV 加载候选点坐标。
+
+    参数:
+        csv_path: 候选点 CSV 文件路径
+
+    返回:
+        候选点坐标列表，每项为 (X, Y) 元组。
+    """
+    path = Path(csv_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Candidate CSV not found: {path}")
+
+    candidates = []
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            x = float(row["X"])
+            y = float(row["Y"])
+            candidates.append((x, y))
+
+    return candidates
+
+
 def build_calculator_from_csv(
     terrain_csv_path: str,
     building_csv_path: str,
+    candidate_csv_path: str,
     **calculator_kwargs: Any,
 ) -> UAVPathCostCalculator:
     """从 CSV 一步构建 UAVPathCostCalculator。
@@ -777,7 +802,8 @@ def build_calculator_from_csv(
     参数:
         terrain_csv_path: 地形 CSV 路径
         building_csv_path: 建筑 CSV 路径
-        **calculator_kwargs: 透传给 UAVPathCostCalculator 的参数
+        candidate_csv_path: 候选点 CSV 路径
+        - **calculator_kwargs: 透传给 UAVPathCostCalculator 的参数
 
     返回:
         初始化完成的 UAVPathCostCalculator 实例。
@@ -785,19 +811,21 @@ def build_calculator_from_csv(
 
     terrain = load_terrain_from_csv(terrain_csv_path)
     obstacles = load_obstacles_from_csv(building_csv_path)
-    return UAVPathCostCalculator(terrain=terrain, obstacles=obstacles, **calculator_kwargs)
+    candidates = load_candidates_from_csv(candidate_csv_path)
+    return UAVPathCostCalculator(terrain=terrain, obstacles=obstacles, candidate_points=candidates, **calculator_kwargs)
 
 
-def _default_data_paths() -> Tuple[Path, Path]:
+def _default_data_paths() -> Tuple[Path, Path, Path]:
     """返回项目默认数据路径。"""
 
-    project_root = Path(__file__).resolve().parents[2]
+    project_root = Path(__file__).resolve().parents[1]
     data_dir = project_root / "数据"
+    candidate_dir = project_root / "数据处理"
     terrain_csv = data_dir / "投影加剪裁后的地形高度数据.csv"
     building_csv = data_dir / "裁剪后的建筑物数据_简洁版.csv"
-    candidate_csv = data_dir / "候选点_适中.csv"
+    candidate_csv = candidate_dir / "候选点_适中.csv"
     
-    return terrain_csv, building_csv, cluster_csv, candidate_csv
+    return terrain_csv, building_csv, candidate_csv
 
 
 def main() -> None:
@@ -808,12 +836,13 @@ def main() -> None:
         2. 否则回退到随机模拟数据，保证脚本可独立运行。
     """
 
-    terrain_csv, building_csv = _default_data_paths()
+    terrain_csv, building_csv, candidate_csv = _default_data_paths()
 
-    if terrain_csv.exists() and building_csv.exists():
+    if terrain_csv.exists() and building_csv.exists() and candidate_csv.exists():   
         calculator = build_calculator_from_csv(
             terrain_csv_path=str(terrain_csv),
             building_csv_path=str(building_csv),
+            candidate_csv_path=str(candidate_csv),
             c_T=1000.0,
             c_B=100.0,
             c_hr=20.0,
@@ -821,6 +850,7 @@ def main() -> None:
             k_nearest=4,
         )
 
+        candidates = calculator.candidate_points
         terrain = calculator.terrain
         obstacles = calculator.obstacles
 

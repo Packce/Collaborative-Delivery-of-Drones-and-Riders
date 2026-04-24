@@ -8,6 +8,7 @@
 """
 
 import csv
+from collections import defaultdict
 from dataclasses import dataclass
 from math import atan2, pi, sqrt
 from pathlib import Path
@@ -205,6 +206,19 @@ class UAVPathCostCalculator:
             self._obs_r = np.empty(0, dtype=float)
             self._obs_top = np.empty(0, dtype=float)
 
+    @staticmethod
+    def _extract_service_points_from_paths(
+        paths: List[List[List[Tuple[float, float, float]]]],
+    ) -> List[Tuple[float, float]]:
+        """从 paths 结构提取实际被服务的候选点坐标集合。"""
+
+        service_points: List[Tuple[float, float]] = []
+        for merchant_paths in paths:
+            for path in merchant_paths:
+                if path:
+                    service_points.append((float(path[-1][0]), float(path[-1][1])))
+        return service_points
+
     def _nearest_obstacle_indices(self, point: Tuple[float, float]) -> np.ndarray:
         """返回距离给定点最近的障碍物索引集合。
 
@@ -378,7 +392,13 @@ class UAVPathCostCalculator:
         """
 
         if not path:
-            return 0.0
+            return float(
+                sqrt(
+                    (end[0] - start[0]) ** 2
+                    + (end[1] - start[1]) ** 2
+                    + (end[2] - start[2]) ** 2
+                )
+            )
 
         dist = sqrt(
             (path[0][0] - start[0]) ** 2
@@ -418,7 +438,7 @@ class UAVPathCostCalculator:
         """
 
         if not path:
-            return 0.0
+            return float(abs(end[2] - start[2]))
 
         delta = abs(path[0][2] - start[2])
         for i in range(1, len(path)):
@@ -464,30 +484,28 @@ class UAVPathCostCalculator:
 
     def rider_time_cost(
         self,
-        paths: List[List[Tuple[float, float, float]]],
+        paths: List[List[List[Tuple[float, float, float]]]],
     ) -> float:
         """计算从候选点到顾客的配送时间代价。
 
         参数:
-            paths: 路径列表，paths[i] 对应 merchants[i] 到候选点的路径，
-                   路径的终点被视为服务候选点
+            paths: 路径列表，paths[i][j] 对应 merchants[i] 到候选点 j 的路径
 
         返回:
-            所有顾客到其最近服务候选点的配送时间之和（小时），乘以权重系数 c_delivery。
+            所有顾客到其最近候选点的配送时间之和（小时），乘以权重系数 c_delivery。
 
         说明:
             - 只考虑 x, y 坐标的距离
             - 配送时间 = 距离 / 骑手平均速度（rider_speed，单位km/h）
             - 距离单位是米，需要除以1000转换为公里
+            - 每个候选点可由多个商家共同服务
         """
-        if not self.customers or not paths:
+        if not self.customers:
             return 0.0
 
-        service_points = []
-        for path in paths:
-            if path:
-                service_points.append((path[-1][0], path[-1][1]))
-
+        service_points = self._extract_service_points_from_paths(paths)
+        if not service_points:
+            service_points = [(float(p[0]), float(p[1])) for p in self.candidate_points]
         if not service_points:
             return 0.0
 
@@ -513,7 +531,7 @@ class UAVPathCostCalculator:
         path: List[Tuple[float, float, float]],
         merchant: Dict[str, Any],
     ) -> float:
-        """计算单个商家到其候选点的无人机构建时间（未乘权重）。
+        """计算单个商家到候选点的无人机构建时间（未乘权重）。
 
         参数:
             path: 该商家到候选点的中间路径点列表
@@ -535,41 +553,50 @@ class UAVPathCostCalculator:
 
         first_point = path[0]
         px, py, pz = first_point[0], first_point[1], first_point[2]
-
         dist_3d = sqrt((mx - px) ** 2 + (my - py) ** 2 + (mz - pz) ** 2)
+
+        for i in range(1, len(path)):
+            dist_3d += sqrt(
+                (path[i][0] - path[i - 1][0]) ** 2
+                + (path[i][1] - path[i - 1][1]) ** 2
+                + (path[i][2] - path[i - 1][2]) ** 2
+            )
+
         drone_time_hours = (dist_3d / 1000.0) / self.drone_speed
 
         return float(drone_time_hours)
 
     def total_drone_time(
         self,
-        paths: List[List[Tuple[float, float, float]]],
+        paths: List[List[List[Tuple[float, float, float]]]],
     ) -> float:
-        """计算所有商家的无人机构建时间总和。
+        """计算所有商家到所有候选点的无人机构建时间总和。
 
         参数:
-            paths: 路径列表，paths[i] 对应 merchants[i] 的路径
+            paths: 路径列表，paths[i][j] 对应 merchants[i] 到候选点 j 的路径
 
         返回:
-            所有商家无人机飞行时间之和（小时）。
+            所有商家到所有候选点无人机飞行时间之和（小时）。
         """
         if not self.merchants or not paths:
             return 0.0
 
         total_time = 0.0
-        for i, path in enumerate(paths):
-            if i < len(self.merchants):
+        for i, merchant_paths in enumerate(paths):
+            if i >= len(self.merchants):
+                break
+            for path in merchant_paths:
                 total_time += self.drone_time_cost(path, self.merchants[i])
         return float(total_time)
 
     def total_time(
         self,
-        paths: List[List[Tuple[float, float, float]]],
+        paths: List[List[List[Tuple[float, float, float]]]],
     ) -> float:
         """计算总时间（所有商家无人机运送时间 + 骑手配送时间）。
 
         参数:
-            paths: 路径列表，paths[i] 对应 merchants[i] 的路径
+            paths: 路径列表，paths[i][j] 对应 merchants[i] 到候选点 j 的路径
 
         返回:
             总时间（小时）= Σ(每商家无人机飞行时间) + 骑手配送时间。
@@ -577,13 +604,17 @@ class UAVPathCostCalculator:
         drone_time = self.total_drone_time(paths)
 
         rider_time = 0.0
-        if self.customers and self.candidate_points:
+        if self.customers:
+            service_points = self._extract_service_points_from_paths(paths)
+            if not service_points:
+                service_points = [(float(p[0]), float(p[1])) for p in self.candidate_points]
+
+        if self.customers and service_points:
             speed_km_per_h = self.rider_speed
             for customer in self.customers:
                 cx, cy = customer.get('x', 0.0), customer.get('y', 0.0)
                 min_distance = float('inf')
-                for candidate in self.candidate_points:
-                    px, py = candidate[0], candidate[1]
+                for px, py in service_points:
                     dist = sqrt((cx - px) ** 2 + (cy - py) ** 2)
                     if dist < min_distance:
                         min_distance = dist
@@ -593,12 +624,12 @@ class UAVPathCostCalculator:
 
     def total_cost(
         self,
-        paths: List[List[Tuple[float, float, float]]],
+        paths: List[List[List[Tuple[float, float, float]]]],
     ) -> float:
-        """计算所有路径的总成本。
+        """计算所有商家到所有候选点路径的总成本。
 
         参数:
-            paths: 路径列表，paths[i] 对应 merchants[i] 到候选点的路径
+            paths: 路径列表，paths[i][j] 对应 merchants[i] 到候选点 j 的路径
 
         返回:
             Σ(每条路径的: 地形代价 + 障碍物代价 + 路程代价 + 高度变化代价 + 转角代价) + 配送时间代价。
@@ -607,7 +638,7 @@ class UAVPathCostCalculator:
             return 0.0
 
         total = 0.0
-        for i, path in enumerate(paths):
+        for i, merchant_paths in enumerate(paths):
             if i >= len(self.merchants):
                 break
 
@@ -615,15 +646,16 @@ class UAVPathCostCalculator:
             mx, my = merchant.get('x', 0.0), merchant.get('y', 0.0)
             mz = self.terrain.get_elevation(mx, my)
 
-            start = (mx, my, mz)
-            end = (path[-1][0], path[-1][1], path[-1][2]) if path else start
+            for path in merchant_paths:
+                start = (mx, my, mz)
+                end = (path[-1][0], path[-1][1], path[-1][2]) if path else start
 
-            tc = self.terrain_cost(path)
-            oc = self.obstacle_collision_cost(path, start, end)
-            fc = self.flight_distance_cost(path, start, end)
-            ac = self.altitude_variation_cost(path, start, end)
-            angc = self.turning_angle_cost(path, start, end)
-            total += tc + oc + fc + ac + angc
+                tc = self.terrain_cost(path)
+                oc = self.obstacle_collision_cost(path, start, end)
+                fc = self.flight_distance_cost(path, start, end)
+                ac = self.altitude_variation_cost(path, start, end)
+                angc = self.turning_angle_cost(path, start, end)
+                total += tc + oc + fc + ac + angc
 
         rc = self.rider_time_cost(paths)
         return float(total + rc)
@@ -870,11 +902,11 @@ def main() -> None:
         2. 否则回退到随机模拟数据，保证脚本可独立运行。
 
     说明:
-        当前演示使用多商家到候选点的路径结构:
+        当前演示使用多商家到所有候选点的路径结构:
         - merchants: 商家列表
-        - paths: 路径列表，paths[i] 对应 merchants[i] 到候选点的飞行路径
-        - 每个路径的终点被视为该商家的服务候选点
-        - rider_time_cost 基于所有商家的服务候选点计算
+        - paths[i][j]: 商家 merchants[i] 到候选点 candidate_points[j] 的路径
+        - 每个商家的无人机可飞到任意候选点
+        - rider_time_cost 基于候选点计算
     """
 
     terrain_csv, building_csv, candidate_csv = _default_data_paths()
@@ -894,7 +926,8 @@ def main() -> None:
         print("Note: 真实路径规划需要:")
         print("  1. 使用 select_random_merchants() 选择商家")
         print("  2. 使用 select_random_customers() 选择顾客")
-        print("  3. 优化算法生成 paths (List[List[Tuple[float,float,float]]])")
+        print("  3. 优化算法生成 paths (List[List[List[Tuple[float,float,float]]]])")
+        print("     其中 paths[i][j] 是商家i到候选点j的路径")
         print("  4. 调用 calculator.total_cost(paths) 评估代价")
     else:
         np.random.seed(42)
@@ -927,8 +960,14 @@ def main() -> None:
         )
 
         paths = [
-            [(200.0, 200.0, 70.0), (350.0, 400.0, 80.0)],
-            [(600.0, 300.0, 75.0), (700.0, 500.0, 85.0)],
+            [
+                [(150.0, 150.0, 60.0), (200.0, 200.0, 70.0)],
+                [(300.0, 250.0, 65.0), (400.0, 350.0, 75.0)],
+            ],
+            [
+                [(550.0, 250.0, 60.0), (600.0, 300.0, 70.0)],
+                [(700.0, 400.0, 65.0), (800.0, 500.0, 75.0)],
+            ],
         ]
 
         total_cost = calculator.total_cost(paths)
@@ -1073,6 +1112,755 @@ def select_random_customers(
         })
 
     return result
+
+
+@dataclass
+class DeliveryOrder:
+    """融合模型中的订单实体。"""
+
+    order_id: str
+    merchant_idx: int
+    customer_idx: int
+    customer_x: float
+    customer_y: float
+    demand: float = 1.0
+    earliest_time: float = 0.0
+    latest_time: float = 1.5
+    service_time: float = 0.03  # 小时，约 1.8 分钟
+
+
+@dataclass
+class FusionModelConfig:
+    """无人机-骑手协同融合模型参数。"""
+
+    max_selected_candidates: int = 4
+    candidate_capacity: float = float("inf")
+    drone_capacity: float = 3.0
+    drone_energy_limit: float = float("inf")
+    rider_capacity: float = 20.0
+    drone_turnaround_time: float = 0.03
+    safe_clearance_height: float = 20.0
+    min_flight_height: float = 20.0
+    max_flight_height: float = 120.0
+    alpha_spatial: float = 0.6
+    late_penalty_coeff: float = 10.0
+    candidate_opening_cost: float = 1.0
+    lambda_drone_cost: float = 1.0
+    lambda_rider_cost: float = 1.0
+    lambda_late_cost: float = 1.0
+    lambda_open_cost: float = 1.0
+    lambda_makespan: float = 1.0
+    select_improvement_tolerance: float = 1e-9
+    allow_infeasible_fallback: bool = False
+
+
+@dataclass
+class FusedModelSolution:
+    """融合优化结果。"""
+
+    selected_candidates: List[int]
+    order_plan: List[Dict[str, Any]]
+    drone_order_indices: Dict[int, List[int]]
+    rider_order_indices: Dict[int, List[int]]
+    objective_components: Dict[str, float]
+    total_objective: float
+    constraint_report: Dict[str, Any]
+
+
+class InfeasibleFusionPlanError(RuntimeError):
+    """融合模型不可行时抛出的异常。"""
+
+
+def build_orders_from_customers(
+    customers: List[Dict[str, Any]],
+    merchants: List[Dict[str, Any]],
+    order_count: Optional[int] = None,
+    random_seed: Optional[int] = None,
+    demand_range: Tuple[float, float] = (0.5, 1.5),
+    earliest_range: Tuple[float, float] = (0.0, 0.5),
+    window_width: float = 1.0,
+    service_time: float = 0.03,
+) -> List[DeliveryOrder]:
+    """从顾客样本构建订单集合（用于融合模型求解）。
+
+    说明:
+        - 若顾客数据中缺少订单量/时间窗，本函数自动合成可复现实验订单。
+        - 每个顾客默认生成 1 个订单。
+        - 订单归属商家采用“最近商家”原则。
+    """
+
+    if not merchants:
+        raise ValueError("merchants is empty; cannot infer merchant_idx for orders")
+    if not customers:
+        return []
+
+    rng = np.random.default_rng(random_seed)
+    count = len(customers) if order_count is None else min(order_count, len(customers))
+    indices = np.arange(len(customers))
+    if count < len(customers):
+        indices = rng.choice(indices, size=count, replace=False)
+
+    def _nearest_merchant_idx(cx: float, cy: float) -> int:
+        best_idx = 0
+        best_dist2 = float("inf")
+        for mi, merchant in enumerate(merchants):
+            mx = float(merchant.get("x", 0.0))
+            my = float(merchant.get("y", 0.0))
+            d2 = (cx - mx) ** 2 + (cy - my) ** 2
+            if d2 < best_dist2:
+                best_dist2 = d2
+                best_idx = mi
+        return best_idx
+
+    low_demand, high_demand = demand_range
+    early_low, early_high = earliest_range
+
+    orders: List[DeliveryOrder] = []
+    for k, idx in enumerate(indices):
+        c = customers[int(idx)]
+        cx = float(c.get("x", 0.0))
+        cy = float(c.get("y", 0.0))
+        earliest = float(rng.uniform(early_low, early_high))
+        latest = earliest + float(window_width)
+        demand = float(rng.uniform(low_demand, high_demand))
+        order_id = str(c.get("id", f"O{k}"))
+
+        orders.append(
+            DeliveryOrder(
+                order_id=order_id,
+                merchant_idx=_nearest_merchant_idx(cx, cy),
+                customer_idx=int(idx),
+                customer_x=cx,
+                customer_y=cy,
+                demand=demand,
+                earliest_time=earliest,
+                latest_time=latest,
+                service_time=float(service_time),
+            )
+        )
+
+    return orders
+
+
+class DroneRiderFusionOptimizer:
+    """候选点选择 + 订单分配 + 多无人机 + 骑手接驳的一体化求解器。
+
+    该实现将论文中的总目标函数落地为可运行代码：
+        Z = λ1*无人机成本 + λ2*骑手时空成本 + λ3*超时惩罚 + λ4*候选点启用成本 + λ5*完工时间
+
+    说明:
+        - 无需额外外部求解器，采用可复现实验的启发式求解。
+        - 无人机航段代价仍调用现有 UAVPathCostCalculator 的子代价函数，保持与原模型一致。
+    """
+
+    def __init__(
+        self,
+        calculator: UAVPathCostCalculator,
+        merchants: List[Dict[str, Any]],
+        candidate_points: List[Tuple[float, float]],
+        orders: List[DeliveryOrder],
+        n_drones: int = 3,
+        n_riders: int = 4,
+        config: Optional[FusionModelConfig] = None,
+    ):
+        if n_drones <= 0:
+            raise ValueError("n_drones must be > 0")
+        if n_riders <= 0:
+            raise ValueError("n_riders must be > 0")
+        if not merchants:
+            raise ValueError("merchants is empty")
+        if not candidate_points:
+            raise ValueError("candidate_points is empty")
+        if not orders:
+            raise ValueError("orders is empty")
+
+        self.calculator = calculator
+        self.merchants = merchants
+        self.candidate_points = candidate_points
+        self.orders = orders
+        self.n_drones = int(n_drones)
+        self.n_riders = int(n_riders)
+        self.config = config if config is not None else FusionModelConfig()
+
+        self._uav_cost: Optional[np.ndarray] = None
+        self._uav_time: Optional[np.ndarray] = None
+        self._uav_energy: Optional[np.ndarray] = None
+        self._order_candidate_score: Optional[np.ndarray] = None
+
+    @staticmethod
+    def _distance_2d(ax: float, ay: float, bx: float, by: float) -> float:
+        return float(sqrt((ax - bx) ** 2 + (ay - by) ** 2))
+
+    @staticmethod
+    def _hours_from_distance(distance_m: float, speed_km_h: float) -> float:
+        speed = max(1e-9, speed_km_h)
+        return float((distance_m / 1000.0) / speed)
+
+    def _compute_uav_leg_metrics(self, merchant_idx: int, candidate_idx: int) -> Tuple[float, float, float]:
+        merchant = self.merchants[merchant_idx]
+        mx = float(merchant.get("x", 0.0))
+        my = float(merchant.get("y", 0.0))
+        gx, gy = self.candidate_points[candidate_idx]
+        gx = float(gx)
+        gy = float(gy)
+
+        terrain = self.calculator.terrain
+        mz = terrain.get_elevation(mx, my)
+        gz = terrain.get_elevation(gx, gy)
+        cruise = max(mz, gz) + self.config.safe_clearance_height
+        cruise = float(np.clip(cruise, self.config.min_flight_height, self.config.max_flight_height))
+
+        start = (mx, my, mz)
+        end = (gx, gy, cruise)
+        mid = ((mx + gx) * 0.5, (my + gy) * 0.5, cruise)
+        path = [mid]
+
+        tc = self.calculator.terrain_cost(path)
+        oc = self.calculator.obstacle_collision_cost(path, start, end)
+        fc = self.calculator.flight_distance_cost(path, start, end)
+        ac = self.calculator.altitude_variation_cost(path, start, end)
+        angc = self.calculator.turning_angle_cost(path, start, end)
+
+        cost = float(tc + oc + fc + ac + angc)
+        flight_time = self._hours_from_distance(fc, self.calculator.drone_speed)
+        energy_proxy = float(fc)
+        return cost, flight_time, energy_proxy
+
+    def _build_uav_matrices(self) -> None:
+        nm = len(self.merchants)
+        ng = len(self.candidate_points)
+        uav_cost = np.zeros((nm, ng), dtype=float)
+        uav_time = np.zeros((nm, ng), dtype=float)
+        uav_energy = np.zeros((nm, ng), dtype=float)
+
+        for mi in range(nm):
+            for gi in range(ng):
+                c, t, e = self._compute_uav_leg_metrics(mi, gi)
+                uav_cost[mi, gi] = c
+                uav_time[mi, gi] = t
+                uav_energy[mi, gi] = e
+
+        self._uav_cost = uav_cost
+        self._uav_time = uav_time
+        self._uav_energy = uav_energy
+
+    def _build_order_candidate_score_matrix(self) -> None:
+        if self._uav_cost is None:
+            self._build_uav_matrices()
+
+        no = len(self.orders)
+        ng = len(self.candidate_points)
+        score = np.zeros((no, ng), dtype=float)
+
+        for oi, order in enumerate(self.orders):
+            mi = int(order.merchant_idx)
+            if mi < 0 or mi >= len(self.merchants):
+                mi = 0
+
+            for gi, (gx, gy) in enumerate(self.candidate_points):
+                gx = float(gx)
+                gy = float(gy)
+                rider_dist = self._distance_2d(order.customer_x, order.customer_y, gx, gy)
+                score[oi, gi] = float(
+                    self.config.lambda_drone_cost * self._uav_cost[mi, gi]
+                    + self.config.lambda_rider_cost * rider_dist
+                )
+
+        self._order_candidate_score = score
+
+    def select_candidates_greedy(self) -> List[int]:
+        """按总成本下降幅度进行候选点贪心选择。"""
+
+        if self._order_candidate_score is None:
+            self._build_order_candidate_score_matrix()
+
+        assert self._order_candidate_score is not None
+        no, ng = self._order_candidate_score.shape
+        max_pick = max(1, min(self.config.max_selected_candidates, ng))
+
+        selected: List[int] = []
+        remaining = set(range(ng))
+        current_best = np.full(no, np.inf, dtype=float)
+        current_total = float("inf")
+
+        for _ in range(max_pick):
+            best_g = None
+            best_total = float("inf")
+            best_vector = None
+
+            for g in list(remaining):
+                v = np.minimum(current_best, self._order_candidate_score[:, g])
+                total = float(np.sum(v)) + (
+                    self.config.lambda_open_cost
+                    * self.config.candidate_opening_cost
+                    * float(len(selected) + 1)
+                )
+                if total < best_total:
+                    best_total = total
+                    best_g = g
+                    best_vector = v
+
+            if best_g is None:
+                break
+
+            if best_total + self.config.select_improvement_tolerance >= current_total:
+                break
+
+            selected.append(best_g)
+            remaining.remove(best_g)
+            if best_vector is not None:
+                current_best = best_vector
+            current_total = best_total
+
+        if not selected:
+            selected = [0]
+        return selected
+
+    def _assign_candidates(self, selected_candidates: List[int]) -> Tuple[List[int], Dict[int, float]]:
+        if self._order_candidate_score is None:
+            self._build_order_candidate_score_matrix()
+        assert self._order_candidate_score is not None
+
+        candidate_load = {g: 0.0 for g in selected_candidates}
+        assigned_candidate = [-1] * len(self.orders)
+
+        for oi, order in enumerate(self.orders):
+            best_g = None
+            best_score = float("inf")
+            fallback_g = selected_candidates[0] if selected_candidates else -1
+
+            for g in selected_candidates:
+                s = float(self._order_candidate_score[oi, g])
+                if candidate_load[g] + order.demand <= self.config.candidate_capacity and s < best_score:
+                    best_score = s
+                    best_g = g
+
+            if best_g is None:
+                if not self.config.allow_infeasible_fallback:
+                    raise InfeasibleFusionPlanError(
+                        f"No feasible candidate for order {order.order_id}: "
+                        "candidate capacity is insufficient under current selected set."
+                    )
+                chosen = fallback_g
+            else:
+                chosen = best_g
+
+            assigned_candidate[oi] = chosen
+            candidate_load[chosen] += float(order.demand)
+
+        return assigned_candidate, candidate_load
+
+    def _assign_drones(
+        self,
+        assigned_candidate: List[int],
+    ) -> Tuple[List[int], List[float], List[float], Dict[int, List[int]], List[float]]:
+        assert self._uav_cost is not None and self._uav_time is not None and self._uav_energy is not None
+
+        n_orders = len(self.orders)
+        assigned_drone = [-1] * n_orders
+        depart_time = [0.0] * n_orders
+        arrival_time = [0.0] * n_orders
+
+        drone_available = [0.0] * self.n_drones
+        drone_energy_used = [0.0] * self.n_drones
+        drone_order_indices: Dict[int, List[int]] = defaultdict(list)
+
+        sorted_orders = sorted(range(n_orders), key=lambda oi: self.orders[oi].earliest_time)
+        for oi in sorted_orders:
+            order = self.orders[oi]
+            g = assigned_candidate[oi]
+            mi = int(order.merchant_idx)
+            if mi < 0 or mi >= len(self.merchants):
+                mi = 0
+
+            best_d = 0
+            best_finish = float("inf")
+            best_depart = 0.0
+            best_arrive = 0.0
+            best_energy = 0.0
+            feasible_found = False
+
+            for d in range(self.n_drones):
+                if order.demand > self.config.drone_capacity:
+                    continue
+                e_need = float(self._uav_energy[mi, g])
+                if drone_energy_used[d] + e_need > self.config.drone_energy_limit:
+                    continue
+
+                dep = max(drone_available[d], order.earliest_time)
+                arr = dep + float(self._uav_time[mi, g])
+                finish = arr + self.config.drone_turnaround_time
+                if finish < best_finish:
+                    best_finish = finish
+                    best_d = d
+                    best_depart = dep
+                    best_arrive = arr
+                    best_energy = e_need
+                    feasible_found = True
+
+            if not feasible_found:
+                if not self.config.allow_infeasible_fallback:
+                    raise InfeasibleFusionPlanError(
+                        f"No feasible drone for order {order.order_id}: "
+                        "drone capacity/energy constraints are violated."
+                    )
+                # 若允许回退，则给出最早可用无人机近似安排
+                best_d = int(np.argmin(drone_available))
+                best_depart = max(drone_available[best_d], order.earliest_time)
+                best_arrive = best_depart + float(self._uav_time[mi, g])
+                best_finish = best_arrive + self.config.drone_turnaround_time
+                best_energy = float(self._uav_energy[mi, g])
+
+            assigned_drone[oi] = best_d
+            depart_time[oi] = best_depart
+            arrival_time[oi] = best_arrive
+
+            drone_available[best_d] = best_finish
+            drone_energy_used[best_d] += best_energy
+            drone_order_indices[best_d].append(oi)
+
+        return assigned_drone, depart_time, arrival_time, drone_order_indices, drone_energy_used
+
+    def _temporal_distance_component(self, order_i: DeliveryOrder, order_j: DeliveryOrder) -> float:
+        """按论文分段公式近似计算 d_ij^T（单位：小时）。"""
+
+        dist_ij = self._distance_2d(
+            order_i.customer_x, order_i.customer_y, order_j.customer_x, order_j.customer_y
+        )
+        t_ij = self._hours_from_distance(dist_ij, self.calculator.rider_speed) + order_i.service_time
+
+        lt_i = float(order_i.earliest_time)
+        ut_i = float(order_i.latest_time)
+        lt_j = float(order_j.earliest_time)
+        ut_j = float(order_j.latest_time)
+
+        lt_j_prime = lt_i + t_ij
+        ut_j_prime = ut_i + t_ij
+
+        if ut_j_prime < lt_j:
+            d_t = 0.5 * (2.0 * lt_j - ut_j_prime - lt_j_prime) + t_ij
+        elif lt_j_prime < lt_j <= ut_j_prime:
+            d_t = 0.5 * (lt_j - lt_j_prime) + t_ij
+        elif lt_j <= lt_j_prime and ut_j_prime <= ut_j:
+            d_t = t_ij
+        elif lt_j_prime <= ut_j < ut_j_prime:
+            denom = max(1e-9, ut_j - lt_j_prime)
+            d_t = ((ut_j_prime - lt_j_prime) / denom) * t_ij
+        else:
+            d_t = 1e6  # 近似 +∞
+        return float(d_t)
+
+    def _spatiotemporal_distance(self, order_i: DeliveryOrder, order_j: DeliveryOrder) -> float:
+        """计算 D_ij = α*d_ij + (1-α)*d_ij^T(等价里程)。"""
+
+        d_ij = self._distance_2d(
+            order_i.customer_x, order_i.customer_y, order_j.customer_x, order_j.customer_y
+        )
+        d_t_h = self._temporal_distance_component(order_i, order_j)
+        d_t_equiv = d_t_h * self.calculator.rider_speed * 1000.0
+        alpha = float(np.clip(self.config.alpha_spatial, 0.0, 1.0))
+        return float(alpha * d_ij + (1.0 - alpha) * d_t_equiv)
+
+    def _rider_transition_cost(
+        self,
+        prev_order_idx: Optional[int],
+        current_order_idx: int,
+        candidate_idx: int,
+    ) -> float:
+        """计算骑手从上一个服务节点转移到当前订单的时空代价。"""
+
+        current_order = self.orders[current_order_idx]
+        gx, gy = self.candidate_points[candidate_idx]
+        gx = float(gx)
+        gy = float(gy)
+
+        if prev_order_idx is None:
+            spatial_m = self._distance_2d(gx, gy, current_order.customer_x, current_order.customer_y)
+            temporal_equiv_m = 0.0
+        else:
+            prev_order = self.orders[prev_order_idx]
+            reposition_m = self._distance_2d(prev_order.customer_x, prev_order.customer_y, gx, gy)
+            delivery_m = self._distance_2d(gx, gy, current_order.customer_x, current_order.customer_y)
+            spatial_m = reposition_m + delivery_m
+            temporal_h = self._temporal_distance_component(prev_order, current_order)
+            temporal_equiv_m = temporal_h * self.calculator.rider_speed * 1000.0
+
+        alpha = float(np.clip(self.config.alpha_spatial, 0.0, 1.0))
+        return float(alpha * spatial_m + (1.0 - alpha) * temporal_equiv_m)
+
+    def _assign_riders(
+        self,
+        assigned_candidate: List[int],
+        arrival_time: List[float],
+    ) -> Tuple[List[int], List[float], List[float], Dict[int, List[int]], float]:
+        n_orders = len(self.orders)
+        assigned_rider = [-1] * n_orders
+        delivery_time = [0.0] * n_orders
+        lateness = [0.0] * n_orders
+        rider_order_indices: Dict[int, List[int]] = defaultdict(list)
+
+        rider_available = [0.0] * self.n_riders
+        rider_pos: List[Optional[Tuple[float, float]]] = [None] * self.n_riders
+        rider_spatiotemporal_cost = 0.0
+
+        sorted_orders = sorted(range(n_orders), key=lambda oi: arrival_time[oi])
+        for oi in sorted_orders:
+            order = self.orders[oi]
+            g = assigned_candidate[oi]
+            gx, gy = self.candidate_points[g]
+            gx = float(gx)
+            gy = float(gy)
+
+            best_r = 0
+            best_finish = float("inf")
+            best_depart = 0.0
+            feasible_found = False
+
+            for r in range(self.n_riders):
+                if order.demand > self.config.rider_capacity:
+                    continue
+
+                pos = rider_pos[r]
+                to_candidate_m = 0.0 if pos is None else self._distance_2d(pos[0], pos[1], gx, gy)
+                to_candidate_h = self._hours_from_distance(to_candidate_m, self.calculator.rider_speed)
+                depart = max(rider_available[r] + to_candidate_h, arrival_time[oi], order.earliest_time)
+
+                leg_m = self._distance_2d(gx, gy, order.customer_x, order.customer_y)
+                leg_h = self._hours_from_distance(leg_m, self.calculator.rider_speed)
+                finish = depart + leg_h + order.service_time
+
+                if finish < best_finish:
+                    best_finish = finish
+                    best_r = r
+                    best_depart = depart
+                    feasible_found = True
+
+            if not feasible_found:
+                if not self.config.allow_infeasible_fallback:
+                    raise InfeasibleFusionPlanError(
+                        f"No feasible rider for order {order.order_id}: "
+                        "rider capacity constraints are violated."
+                    )
+                best_r = int(np.argmin(rider_available))
+                pos = rider_pos[best_r]
+                to_candidate_m = 0.0 if pos is None else self._distance_2d(pos[0], pos[1], gx, gy)
+                to_candidate_h = self._hours_from_distance(to_candidate_m, self.calculator.rider_speed)
+                best_depart = max(rider_available[best_r] + to_candidate_h, arrival_time[oi], order.earliest_time)
+                leg_m = self._distance_2d(gx, gy, order.customer_x, order.customer_y)
+                leg_h = self._hours_from_distance(leg_m, self.calculator.rider_speed)
+                best_finish = best_depart + leg_h + order.service_time
+
+            assigned_rider[oi] = best_r
+            delivery_time[oi] = best_finish
+            lateness[oi] = max(0.0, best_finish - order.latest_time)
+
+            previous_orders = rider_order_indices[best_r]
+            prev_idx = previous_orders[-1] if previous_orders else None
+            rider_spatiotemporal_cost += self._rider_transition_cost(prev_idx, oi, g)
+
+            rider_order_indices[best_r].append(oi)
+            rider_available[best_r] = best_finish
+            rider_pos[best_r] = (order.customer_x, order.customer_y)
+
+        return assigned_rider, delivery_time, lateness, rider_order_indices, float(rider_spatiotemporal_cost)
+
+    def _evaluate_objective(
+        self,
+        selected_candidates: List[int],
+        assigned_candidate: List[int],
+        assigned_drone: List[int],
+        delivery_time: List[float],
+        lateness: List[float],
+        rider_spatiotemporal_cost: float,
+    ) -> Tuple[Dict[str, float], float]:
+        assert self._uav_cost is not None
+
+        drone_cost = 0.0
+        for oi, order in enumerate(self.orders):
+            mi = int(order.merchant_idx)
+            if mi < 0 or mi >= len(self.merchants):
+                mi = 0
+            g = assigned_candidate[oi]
+            drone_cost += float(self._uav_cost[mi, g])
+
+        late_cost = self.config.late_penalty_coeff * float(sum(lateness))
+        open_cost = self.config.candidate_opening_cost * float(len(selected_candidates))
+        makespan = max(delivery_time) if delivery_time else 0.0
+
+        weighted_total = (
+            self.config.lambda_drone_cost * drone_cost
+            + self.config.lambda_rider_cost * rider_spatiotemporal_cost
+            + self.config.lambda_late_cost * late_cost
+            + self.config.lambda_open_cost * open_cost
+            + self.config.lambda_makespan * makespan
+        )
+
+        components = {
+            "drone_cost": float(drone_cost),
+            "rider_spatiotemporal_cost": float(rider_spatiotemporal_cost),
+            "late_cost": float(late_cost),
+            "open_cost": float(open_cost),
+            "makespan": float(makespan),
+            "n_selected_candidates": float(len(selected_candidates)),
+            "n_assigned_drones": float(len(set(assigned_drone))),
+        }
+        return components, float(weighted_total)
+
+    def _build_constraint_report(
+        self,
+        selected_candidates: List[int],
+        assigned_candidate: List[int],
+        assigned_drone: List[int],
+        assigned_rider: List[int],
+        drone_order_indices: Dict[int, List[int]],
+        drone_energy_used: List[float],
+        depart_time: List[float],
+        arrival_time: List[float],
+        candidate_load: Dict[int, float],
+    ) -> Dict[str, Any]:
+        report: Dict[str, Any] = {}
+        report["candidate_limit_ok"] = len(selected_candidates) <= self.config.max_selected_candidates
+        report["all_orders_have_candidate"] = all(g >= 0 for g in assigned_candidate)
+        report["all_orders_have_drone"] = all(d >= 0 for d in assigned_drone)
+        report["all_orders_have_rider"] = all(r >= 0 for r in assigned_rider)
+        report["candidate_activation_ok"] = all(g in selected_candidates for g in assigned_candidate)
+        report["candidate_capacity_ok"] = all(
+            load <= self.config.candidate_capacity + 1e-9 for load in candidate_load.values()
+        )
+
+        drone_capacity_ok = True
+        for oi, order in enumerate(self.orders):
+            if order.demand > self.config.drone_capacity + 1e-9:
+                drone_capacity_ok = False
+                break
+        report["drone_capacity_ok"] = drone_capacity_ok
+
+        rider_capacity_ok = True
+        for oi, order in enumerate(self.orders):
+            if order.demand > self.config.rider_capacity + 1e-9:
+                rider_capacity_ok = False
+                break
+        report["rider_capacity_ok"] = rider_capacity_ok
+
+        report["drone_energy_ok"] = all(e <= self.config.drone_energy_limit + 1e-9 for e in drone_energy_used)
+
+        overlap_ok = True
+        for drone_idx, idxs in drone_order_indices.items():
+            if not idxs:
+                continue
+            idxs_sorted = sorted(idxs, key=lambda i: depart_time[i])
+            for pos in range(1, len(idxs_sorted)):
+                prev_idx = idxs_sorted[pos - 1]
+                curr_idx = idxs_sorted[pos]
+                required_gap = arrival_time[prev_idx] + self.config.drone_turnaround_time
+                if depart_time[curr_idx] + 1e-9 < required_gap:
+                    overlap_ok = False
+                    break
+            if not overlap_ok:
+                break
+            _ = drone_idx
+        report["drone_overlap_ok"] = overlap_ok
+
+        bool_values = [v for v in report.values() if isinstance(v, bool)]
+        report["all_constraints_ok"] = all(bool_values)
+        return report
+
+    def solve(self) -> FusedModelSolution:
+        """执行融合求解并返回结构化结果。"""
+
+        self._build_uav_matrices()
+        self._build_order_candidate_score_matrix()
+
+        selected_candidates = self.select_candidates_greedy()
+        assigned_candidate, candidate_load = self._assign_candidates(selected_candidates)
+
+        assigned_drone, depart_time, arrival_time, drone_order_indices, drone_energy_used = self._assign_drones(
+            assigned_candidate
+        )
+        assigned_rider, delivery_time, lateness, rider_order_indices, rider_st_cost = self._assign_riders(
+            assigned_candidate, arrival_time
+        )
+
+        components, total_objective = self._evaluate_objective(
+            selected_candidates=selected_candidates,
+            assigned_candidate=assigned_candidate,
+            assigned_drone=assigned_drone,
+            delivery_time=delivery_time,
+            lateness=lateness,
+            rider_spatiotemporal_cost=rider_st_cost,
+        )
+
+        constraint_report = self._build_constraint_report(
+            selected_candidates=selected_candidates,
+            assigned_candidate=assigned_candidate,
+            assigned_drone=assigned_drone,
+            assigned_rider=assigned_rider,
+            drone_order_indices=drone_order_indices,
+            drone_energy_used=drone_energy_used,
+            depart_time=depart_time,
+            arrival_time=arrival_time,
+            candidate_load=candidate_load,
+        )
+
+        order_plan: List[Dict[str, Any]] = []
+        for oi, order in enumerate(self.orders):
+            order_plan.append(
+                {
+                    "order_index": oi,
+                    "order_id": order.order_id,
+                    "merchant_idx": int(order.merchant_idx),
+                    "customer_idx": int(order.customer_idx),
+                    "candidate_idx": int(assigned_candidate[oi]),
+                    "drone_idx": int(assigned_drone[oi]),
+                    "rider_idx": int(assigned_rider[oi]),
+                    "uav_depart_time_h": float(depart_time[oi]),
+                    "uav_arrival_time_h": float(arrival_time[oi]),
+                    "delivery_time_h": float(delivery_time[oi]),
+                    "lateness_h": float(lateness[oi]),
+                    "demand": float(order.demand),
+                }
+            )
+
+        return FusedModelSolution(
+            selected_candidates=selected_candidates,
+            order_plan=order_plan,
+            drone_order_indices={int(k): list(v) for k, v in drone_order_indices.items()},
+            rider_order_indices={int(k): list(v) for k, v in rider_order_indices.items()},
+            objective_components=components,
+            total_objective=total_objective,
+            constraint_report=constraint_report,
+        )
+
+
+def solve_fused_delivery_model(
+    calculator: UAVPathCostCalculator,
+    merchants: List[Dict[str, Any]],
+    customers: List[Dict[str, Any]],
+    candidate_points: List[Tuple[float, float]],
+    n_drones: int = 3,
+    n_riders: int = 4,
+    order_count: Optional[int] = None,
+    random_seed: Optional[int] = 42,
+    config: Optional[FusionModelConfig] = None,
+) -> FusedModelSolution:
+    """融合模型的便捷入口函数。"""
+
+    orders = build_orders_from_customers(
+        customers=customers,
+        merchants=merchants,
+        order_count=order_count,
+        random_seed=random_seed,
+    )
+    optimizer = DroneRiderFusionOptimizer(
+        calculator=calculator,
+        merchants=merchants,
+        candidate_points=candidate_points,
+        orders=orders,
+        n_drones=n_drones,
+        n_riders=n_riders,
+        config=config,
+    )
+    return optimizer.solve()
 
 
 if __name__ == "__main__":

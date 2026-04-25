@@ -1167,6 +1167,393 @@ class FusedModelSolution:
     constraint_report: Dict[str, Any]
 
 
+def _terrain_color_map_vectorized(z_normalized: np.ndarray) -> np.ndarray:
+    """仿照 render_map.py 的分段渐变地形配色。"""
+
+    z_norm = np.asarray(z_normalized, dtype=float)
+    z = np.clip(z_norm.reshape(-1), 0.0, 1.0)
+    r = np.zeros_like(z)
+    g = np.zeros_like(z)
+    b = np.zeros_like(z)
+
+    mask1 = z < 0.2
+    mask2 = (z >= 0.2) & (z < 0.4)
+    mask3 = (z >= 0.4) & (z < 0.6)
+    mask4 = (z >= 0.6) & (z < 0.8)
+    mask5 = z >= 0.8
+
+    t1 = z[mask1] / 0.2
+    r[mask1] = 0.20 + 0.10 * t1
+    g[mask1] = 0.50 + 0.20 * t1
+    b[mask1] = 0.25 + 0.05 * t1
+
+    t2 = (z[mask2] - 0.2) / 0.2
+    r[mask2] = 0.30 + 0.15 * t2
+    g[mask2] = 0.70 + 0.05 * t2
+    b[mask2] = 0.30 - 0.10 * t2
+
+    t3 = (z[mask3] - 0.4) / 0.2
+    r[mask3] = 0.45 + 0.15 * t3
+    g[mask3] = 0.75 - 0.15 * t3
+    b[mask3] = 0.20 + 0.05 * t3
+
+    t4 = (z[mask4] - 0.6) / 0.2
+    r[mask4] = 0.60 + 0.15 * t4
+    g[mask4] = 0.60 - 0.20 * t4
+    b[mask4] = 0.25 + 0.10 * t4
+
+    t5 = (z[mask5] - 0.8) / 0.2
+    r[mask5] = 0.75 + 0.15 * t5
+    g[mask5] = 0.40 - 0.15 * t5
+    b[mask5] = 0.35 + 0.15 * t5
+
+    colors = np.stack([r, g, b], axis=1)
+    return colors.reshape((*z_norm.shape, 3))
+
+
+def _building_color_by_height(height: float) -> Tuple[float, float, float]:
+    """仿照 render_map.py 的建筑高度分级配色。"""
+
+    if height < 50.0:
+        return (0.40, 0.42, 0.45)
+    if height < 100.0:
+        return (0.50, 0.55, 0.62)
+    if height < 150.0:
+        return (0.60, 0.65, 0.72)
+    if height < 200.0:
+        return (0.72, 0.76, 0.82)
+    return (0.85, 0.87, 0.90)
+
+
+def _extract_solution_routes(
+    terrain: Terrain,
+    merchants: List[Dict[str, Any]],
+    customers: List[Dict[str, Any]],
+    candidate_points: List[Tuple[float, float]],
+    solution: FusedModelSolution,
+    safe_clearance_height: float,
+    min_flight_height: float,
+    max_flight_height: float,
+    rider_ground_lift: float,
+) -> List[Dict[str, Any]]:
+    """将最终规划结果转换为可绘制的无人机/骑手路径。"""
+
+    routes: List[Dict[str, Any]] = []
+    if not candidate_points or not solution.order_plan:
+        return routes
+
+    lift = max(0.5, float(rider_ground_lift))
+    for plan in solution.order_plan:
+        merchant_idx = int(plan.get("merchant_idx", -1))
+        customer_idx = int(plan.get("customer_idx", -1))
+        candidate_idx = int(plan.get("candidate_idx", -1))
+        drone_idx = int(plan.get("drone_idx", -1))
+        rider_idx = int(plan.get("rider_idx", -1))
+
+        if not (0 <= merchant_idx < len(merchants)):
+            continue
+        if not (0 <= candidate_idx < len(candidate_points)):
+            continue
+
+        merchant = merchants[merchant_idx]
+        mx = float(merchant.get("x", 0.0))
+        my = float(merchant.get("y", 0.0))
+        gx, gy = candidate_points[candidate_idx]
+        gx = float(gx)
+        gy = float(gy)
+
+        if 0 <= customer_idx < len(customers):
+            customer = customers[customer_idx]
+            cx = float(customer.get("x", gx))
+            cy = float(customer.get("y", gy))
+        else:
+            cx, cy = gx, gy
+
+        mz = terrain.get_elevation(mx, my)
+        gz = terrain.get_elevation(gx, gy)
+        cz = terrain.get_elevation(cx, cy)
+
+        cruise = max(mz, gz) + float(safe_clearance_height)
+        cruise = float(np.clip(cruise, float(min_flight_height), float(max_flight_height)))
+
+        mid = ((mx + gx) * 0.5, (my + gy) * 0.5, cruise)
+        uav_path = [(mx, my, mz), mid, (gx, gy, cruise)]
+        rider_path = [(gx, gy, gz + lift), (cx, cy, cz + lift)]
+
+        routes.append(
+            {
+                "order_index": int(plan.get("order_index", -1)),
+                "drone_idx": drone_idx,
+                "rider_idx": rider_idx,
+                "candidate_idx": candidate_idx,
+                "uav_path": uav_path,
+                "rider_path": rider_path,
+            }
+        )
+    return routes
+
+
+def render_fused_solution_map(
+    terrain: Terrain,
+    obstacles: List[Obstacle],
+    merchants: List[Dict[str, Any]],
+    customers: List[Dict[str, Any]],
+    candidate_points: List[Tuple[float, float]],
+    solution: FusedModelSolution,
+    save_path: Optional[str] = None,
+    show: bool = True,
+    safe_clearance_height: float = 20.0,
+    min_flight_height: float = 20.0,
+    max_flight_height: float = 120.0,
+    rider_ground_lift: float = 2.0,
+    window_size: Tuple[int, int] = (1600, 1000),
+) -> Optional[str]:
+    """绘制融合模型最终规划路径图（地形+建筑+无人机+骑手）。
+
+    风格参考 render_map.py，包含:
+    - 分段地形渐变色
+    - 建筑按高度分级配色
+    - 柔和背景与双光源
+    """
+
+    if not show and not save_path:
+        raise ValueError("show=False 时需要提供 save_path 以便输出图像。")
+
+    try:
+        import pyvista as pv
+    except ImportError as exc:
+        raise ImportError(
+            "render_fused_solution_map 依赖 pyvista，请先安装: pip install pyvista"
+        ) from exc
+
+    grid_x, grid_y = np.meshgrid(terrain.x_coords, terrain.y_coords)
+    grid_z = np.asarray(terrain.elevation, dtype=float)
+
+    terrain_mesh = pv.StructuredGrid(grid_x, grid_y, grid_z)
+    z_min = float(np.nanmin(grid_z))
+    z_max = float(np.nanmax(grid_z))
+    z_norm = (grid_z - z_min) / (z_max - z_min + 1e-9)
+    terrain_colors = _terrain_color_map_vectorized(z_norm)
+    terrain_mesh["terrain_colors"] = terrain_colors.reshape(-1, 3)
+
+    off_screen = bool(save_path) and not show
+    plotter = pv.Plotter(off_screen=off_screen, window_size=window_size)
+
+    plotter.add_mesh(
+        terrain_mesh,
+        rgb=True,
+        scalars="terrain_colors",
+        show_scalar_bar=False,
+        opacity=0.92,
+        show_edges=False,
+        edge_color=(0.3, 0.4, 0.3),
+        smooth_shading=True,
+    )
+
+    for obs in obstacles:
+        radius = float(obs.r)
+        height = float(obs.z)
+        if radius < 1.0 or height <= 0.0:
+            continue
+
+        ox = float(obs.x)
+        oy = float(obs.y)
+        base_z = terrain.get_elevation(ox, oy)
+        building = pv.Cylinder(
+            center=(ox, oy, base_z + height / 2.0),
+            direction=(0.0, 0.0, 1.0),
+            radius=radius,
+            height=height,
+            resolution=12,
+        )
+        plotter.add_mesh(
+            building,
+            color=_building_color_by_height(height),
+            opacity=0.95,
+            smooth_shading=True,
+            specular=0.4,
+            metallic=0.15,
+        )
+
+    routes = _extract_solution_routes(
+        terrain=terrain,
+        merchants=merchants,
+        customers=customers,
+        candidate_points=candidate_points,
+        solution=solution,
+        safe_clearance_height=safe_clearance_height,
+        min_flight_height=min_flight_height,
+        max_flight_height=max_flight_height,
+        rider_ground_lift=rider_ground_lift,
+    )
+
+    drone_palette = [
+        (0.94, 0.35, 0.24),
+        (0.96, 0.58, 0.20),
+        (0.86, 0.44, 0.24),
+        (0.90, 0.66, 0.26),
+        (0.78, 0.33, 0.21),
+    ]
+    rider_palette = [
+        (0.16, 0.46, 0.76),
+        (0.21, 0.58, 0.67),
+        (0.23, 0.52, 0.44),
+        (0.25, 0.40, 0.72),
+        (0.13, 0.34, 0.57),
+    ]
+
+    for route in routes:
+        uav_path = np.asarray(route["uav_path"], dtype=float)
+        rider_path = np.asarray(route["rider_path"], dtype=float)
+        drone_idx = int(route["drone_idx"])
+        rider_idx = int(route["rider_idx"])
+
+        drone_color = drone_palette[drone_idx % len(drone_palette)] if drone_idx >= 0 else drone_palette[0]
+        rider_color = rider_palette[rider_idx % len(rider_palette)] if rider_idx >= 0 else rider_palette[0]
+
+        if uav_path.shape[0] >= 3:
+            drone_line = pv.Spline(uav_path, n_points=80)
+        else:
+            drone_line = pv.Line(uav_path[0], uav_path[-1], resolution=1)
+        plotter.add_mesh(
+            drone_line,
+            color=drone_color,
+            line_width=5.0,
+            render_lines_as_tubes=True,
+            opacity=0.95,
+        )
+
+        rider_line = pv.Line(rider_path[0], rider_path[-1], resolution=1)
+        plotter.add_mesh(
+            rider_line,
+            color=rider_color,
+            line_width=3.0,
+            render_lines_as_tubes=True,
+            opacity=0.90,
+        )
+
+    if merchants:
+        merchant_xyz = np.array(
+            [
+                (
+                    float(m.get("x", 0.0)),
+                    float(m.get("y", 0.0)),
+                    terrain.get_elevation(float(m.get("x", 0.0)), float(m.get("y", 0.0))) + 3.0,
+                )
+                for m in merchants
+            ],
+            dtype=float,
+        )
+        plotter.add_points(
+            merchant_xyz,
+            color=(0.82, 0.20, 0.16),
+            point_size=15,
+            render_points_as_spheres=True,
+        )
+
+    if customers:
+        customer_xyz = np.array(
+            [
+                (
+                    float(c.get("x", 0.0)),
+                    float(c.get("y", 0.0)),
+                    terrain.get_elevation(float(c.get("x", 0.0)), float(c.get("y", 0.0))) + 2.0,
+                )
+                for c in customers
+            ],
+            dtype=float,
+        )
+        plotter.add_points(
+            customer_xyz,
+            color=(0.16, 0.42, 0.70),
+            point_size=11,
+            render_points_as_spheres=True,
+        )
+
+    if candidate_points:
+        candidate_xyz = np.array(
+            [
+                (float(gx), float(gy), terrain.get_elevation(float(gx), float(gy)) + 1.5)
+                for gx, gy in candidate_points
+            ],
+            dtype=float,
+        )
+        selected_set = set(int(i) for i in solution.selected_candidates)
+        selected_idx = [i for i in range(len(candidate_points)) if i in selected_set]
+        unselected_idx = [i for i in range(len(candidate_points)) if i not in selected_set]
+
+        if unselected_idx:
+            plotter.add_points(
+                candidate_xyz[unselected_idx, :],
+                color=(0.94, 0.94, 0.94),
+                point_size=8,
+                render_points_as_spheres=True,
+                opacity=0.75,
+            )
+        if selected_idx:
+            plotter.add_points(
+                candidate_xyz[selected_idx, :],
+                color=(0.98, 0.82, 0.22),
+                point_size=16,
+                render_points_as_spheres=True,
+            )
+
+    plotter.set_background("#d0dde8")
+
+    center_x = 0.5 * (terrain.x_min + terrain.x_max)
+    center_y = 0.5 * (terrain.y_min + terrain.y_max)
+    center_z = float(np.nanmean(grid_z))
+
+    light1 = pv.Light(
+        position=(terrain.x_min - 300.0, terrain.y_min - 300.0, z_max + 300.0),
+        focal_point=(center_x, center_y, center_z),
+        intensity=1.0,
+        color=(1.0, 0.98, 0.95),
+    )
+    plotter.add_light(light1)
+
+    light2 = pv.Light(
+        position=(terrain.x_max + 300.0, terrain.y_max + 300.0, z_max + 200.0),
+        focal_point=(center_x, center_y, center_z),
+        intensity=0.5,
+        color=(0.9, 0.92, 1.0),
+    )
+    plotter.add_light(light2)
+    plotter.enable_lightkit()
+
+    plotter.camera_position = [
+        (terrain.x_min - 300.0, terrain.y_min - 300.0, z_max + 250.0),
+        (center_x, center_y, center_z),
+        (0.0, 0.0, 1.0),
+    ]
+
+    plotter.add_text(
+        "Fused Delivery Plan",
+        position="upper_left",
+        font_size=12,
+        color=(0.12, 0.18, 0.26),
+    )
+
+    saved_file: Optional[str] = None
+    if save_path:
+        save_file = Path(save_path).expanduser().resolve()
+        save_file.parent.mkdir(parents=True, exist_ok=True)
+        saved_file = str(save_file)
+
+    if show:
+        if saved_file:
+            plotter.show(screenshot=saved_file)
+        else:
+            plotter.show()
+    else:
+        plotter.show(auto_close=False)
+        if saved_file:
+            plotter.screenshot(saved_file)
+        plotter.close()
+
+    return saved_file
+
+
 class InfeasibleFusionPlanError(RuntimeError):
     """融合模型不可行时抛出的异常。"""
 
@@ -1842,8 +2229,17 @@ def solve_fused_delivery_model(
     order_count: Optional[int] = None,
     random_seed: Optional[int] = 42,
     config: Optional[FusionModelConfig] = None,
+    render_plan: bool = False,
+    render_save_path: Optional[str] = None,
+    render_show: bool = False,
 ) -> FusedModelSolution:
-    """融合模型的便捷入口函数。"""
+    """融合模型的便捷入口函数。
+
+    参数:
+        render_plan: 是否在求解后渲染路径规划图
+        render_save_path: 渲染图像输出路径（如 .png），为空则不落盘
+        render_show: 是否弹出交互窗口显示图像
+    """
 
     orders = build_orders_from_customers(
         customers=customers,
@@ -1860,7 +2256,24 @@ def solve_fused_delivery_model(
         n_riders=n_riders,
         config=config,
     )
-    return optimizer.solve()
+    solution = optimizer.solve()
+
+    if render_plan or render_save_path:
+        render_fused_solution_map(
+            terrain=calculator.terrain,
+            obstacles=calculator.obstacles,
+            merchants=merchants,
+            customers=customers,
+            candidate_points=candidate_points,
+            solution=solution,
+            save_path=render_save_path,
+            show=(render_show or render_save_path is None),
+            safe_clearance_height=optimizer.config.safe_clearance_height,
+            min_flight_height=optimizer.config.min_flight_height,
+            max_flight_height=optimizer.config.max_flight_height,
+        )
+
+    return solution
 
 
 if __name__ == "__main__":

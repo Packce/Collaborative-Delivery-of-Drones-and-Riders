@@ -12,7 +12,8 @@ from collections import defaultdict
 from dataclasses import dataclass
 from math import atan2, pi, sqrt
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+import time
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -910,26 +911,93 @@ def main() -> None:
     """
 
     terrain_csv, building_csv, candidate_csv = _default_data_paths()
+    project_root = Path(__file__).resolve().parents[1]
+    merchant_csv = project_root / "数据" / "商家数据.csv"
+    customer_csv = project_root / "数据" / "顾客数据.csv"
+    NSGA_OPTION = True #改进的遗传算法NSGA-II使用开关
+    
 
-    if terrain_csv.exists() and building_csv.exists() and candidate_csv.exists():
+    if (
+        terrain_csv.exists()
+        and building_csv.exists()
+        and candidate_csv.exists()
+        and merchant_csv.exists()
+        and customer_csv.exists()
+    ):
         terrain = load_terrain_from_csv(str(terrain_csv))
         obstacles = load_obstacles_from_csv(str(building_csv))
         candidate_points = load_candidates_from_csv(str(candidate_csv))
+        merchants = select_random_merchants(str(merchant_csv), n=6, random_seed=42)
+        customers = select_random_customers(str(customer_csv), m=120, random_seed=42)
+        calculator = UAVPathCostCalculator(
+            terrain=terrain,
+            obstacles=obstacles,
+            merchants=merchants,
+            customers=customers,
+            candidate_points=candidate_points,
+            rider_speed=15.0,
+            drone_speed=50.0,
+        )
 
         print("Loaded real dataset successfully.")
         print(f"Terrain grid: {terrain.ny} x {terrain.nx}")
         print(f"Obstacle count: {len(obstacles)}")
         print(f"Candidate points count: {len(candidate_points)}")
+        print(f"Sampled merchants: {len(merchants)}")
+        print(f"Sampled customers: {len(customers)}")
         print(f"X range: [{terrain.x_min:.3f}, {terrain.x_max:.3f}]")
         print(f"Y range: [{terrain.y_min:.3f}, {terrain.y_max:.3f}]")
-        print()
-        print("Note: 真实路径规划需要:")
-        print("  1. 使用 select_random_merchants() 选择商家")
-        print("  2. 使用 select_random_customers() 选择顾客")
-        print("  3. 优化算法生成 paths (List[List[List[Tuple[float,float,float]]]])")
-        print("     其中 paths[i][j] 是商家i到候选点j的路径")
-        print("  4. 调用 calculator.total_cost(paths) 评估代价")
+
+        if NSGA_OPTION:
+            # NSGA-II：改进的遗传算法
+            print("Starting NSGA-II optimization...")
+            cfg = FusionModelConfig(
+                solver_mode="nsga2",
+                ga_population_size=60,
+                ga_generations=120,
+                ga_verbose=True,
+                max_selected_candidates=6,
+                ga_random_seed=42,
+            )
+            output_dir = project_root / "统一输出"
+            plan_path = output_dir / "最终优化路径图.png"
+
+            solution = solve_fused_delivery_model(
+                calculator=calculator,
+                merchants=merchants,
+                customers=customers,
+                candidate_points=candidate_points,
+                n_drones=8,
+                n_riders=20,
+                order_count=120,
+                random_seed=42,
+                config=cfg,
+                render_plan=["uav", "rider"],
+                render_save_path=str(plan_path),
+                render_show=True,
+                render_performance=True,
+                performance_save_dir=str(output_dir),
+                performance_show=False,
+                performance_file_prefix="nsga2_compare",
+            )
+
+            print()
+            print(f"Solver mode: {solution.solver_mode}")
+            print(f"Objective vector (f1,f2,f3): {solution.objective_vector}")
+            print(f"Pareto size: {len(solution.pareto_front or [])}")
+            print(f"Constraints OK: {solution.constraint_report.get('all_constraints_ok')}")
+            print(f"Selected candidates: {solution.selected_candidates}")
+            if solution.rendered_plan_paths:
+                print("Rendered path maps:")
+                for mode, path in solution.rendered_plan_paths.items():
+                    print(f"  - {mode}: {path}")
+            if solution.performance_plot_paths:
+                print("Rendered performance plots:")
+                for name, path in solution.performance_plot_paths.items():
+                    print(f"  - {name}: {path}")
+                 
     else:
+        print("Default real-data files are incomplete; fallback to demo data.")
         np.random.seed(42)
         demo_elevation = np.random.uniform(0, 50, size=(128, 128))
         terrain = Terrain(demo_elevation, x_range=(0, 1000), y_range=(0, 1000))
@@ -1152,6 +1220,16 @@ class FusionModelConfig:
     lambda_makespan: float = 1.0
     select_improvement_tolerance: float = 1e-9
     allow_infeasible_fallback: bool = False
+    solver_mode: str = "nsga2"  # "heuristic" or "nsga2"
+    # solver_mode: str ="heuristic"
+    ga_population_size: int = 60
+    ga_generations: int = 120
+    ga_crossover_prob: float = 0.8
+    ga_mutation_prob: float = 0.2
+    ga_layer_mutation_prob: float = 0.33
+    ga_random_seed: Optional[int] = 42
+    ga_force_mutation_if_none: bool = True
+    ga_verbose: bool = False
 
 
 @dataclass
@@ -1165,6 +1243,26 @@ class FusedModelSolution:
     objective_components: Dict[str, float]
     total_objective: float
     constraint_report: Dict[str, Any]
+    solver_mode: str = "heuristic"
+    objective_vector: Optional[Tuple[float, float, float]] = None
+    pareto_front: Optional[List[Dict[str, Any]]] = None
+    performance_report: Optional[Dict[str, Any]] = None
+    rendered_plan_paths: Optional[Dict[str, str]] = None
+    performance_plot_paths: Optional[Dict[str, str]] = None
+
+
+@dataclass
+class NSGA2Individual:
+    """多目标遗传算法个体（三层编码）。"""
+
+    order_sequence: List[int]          # O: 订单服务顺序（排列）
+    candidate_assignment: List[int]    # D: 订单->候选点分配
+    candidate_open: List[int]          # F: 候选点启用标记（0/1）
+    objectives: Tuple[float, float, float] = (float("inf"), float("inf"), float("inf"))
+    cv: float = float("inf")           # constraint violation
+    rank: int = 10**9
+    crowding_distance: float = 0.0
+    decoded: Optional[Dict[str, Any]] = None
 
 
 def _terrain_color_map_vectorized(z_normalized: np.ndarray) -> np.ndarray:
@@ -1306,6 +1404,9 @@ def render_fused_solution_map(
     min_flight_height: float = 20.0,
     max_flight_height: float = 120.0,
     rider_ground_lift: float = 2.0,
+    show_uav_paths: bool = True,
+    show_rider_paths: bool = True,
+    title: str = "Fused Delivery Plan",
     window_size: Tuple[int, int] = (1600, 1000),
 ) -> Optional[str]:
     """绘制融合模型最终规划路径图（地形+建筑+无人机+骑手）。
@@ -1318,6 +1419,8 @@ def render_fused_solution_map(
 
     if not show and not save_path:
         raise ValueError("show=False 时需要提供 save_path 以便输出图像。")
+    if not show_uav_paths and not show_rider_paths:
+        raise ValueError("show_uav_paths 和 show_rider_paths 不能同时为 False。")
 
     try:
         import pyvista as pv
@@ -1403,34 +1506,36 @@ def render_fused_solution_map(
     ]
 
     for route in routes:
-        uav_path = np.asarray(route["uav_path"], dtype=float)
-        rider_path = np.asarray(route["rider_path"], dtype=float)
         drone_idx = int(route["drone_idx"])
         rider_idx = int(route["rider_idx"])
 
         drone_color = drone_palette[drone_idx % len(drone_palette)] if drone_idx >= 0 else drone_palette[0]
         rider_color = rider_palette[rider_idx % len(rider_palette)] if rider_idx >= 0 else rider_palette[0]
 
-        if uav_path.shape[0] >= 3:
-            drone_line = pv.Spline(uav_path, n_points=80)
-        else:
-            drone_line = pv.Line(uav_path[0], uav_path[-1], resolution=1)
-        plotter.add_mesh(
-            drone_line,
-            color=drone_color,
-            line_width=5.0,
-            render_lines_as_tubes=True,
-            opacity=0.95,
-        )
+        if show_uav_paths:
+            uav_path = np.asarray(route["uav_path"], dtype=float)
+            if uav_path.shape[0] >= 3:
+                drone_line = pv.Spline(uav_path, n_points=80)
+            else:
+                drone_line = pv.Line(uav_path[0], uav_path[-1], resolution=1)
+            plotter.add_mesh(
+                drone_line,
+                color=drone_color,
+                line_width=5.0,
+                render_lines_as_tubes=True,
+                opacity=0.95,
+            )
 
-        rider_line = pv.Line(rider_path[0], rider_path[-1], resolution=1)
-        plotter.add_mesh(
-            rider_line,
-            color=rider_color,
-            line_width=3.0,
-            render_lines_as_tubes=True,
-            opacity=0.90,
-        )
+        if show_rider_paths:
+            rider_path = np.asarray(route["rider_path"], dtype=float)
+            rider_line = pv.Line(rider_path[0], rider_path[-1], resolution=1)
+            plotter.add_mesh(
+                rider_line,
+                color=rider_color,
+                line_width=3.0,
+                render_lines_as_tubes=True,
+                opacity=0.90,
+            )
 
     if merchants:
         merchant_xyz = np.array(
@@ -1527,12 +1632,7 @@ def render_fused_solution_map(
         (0.0, 0.0, 1.0),
     ]
 
-    plotter.add_text(
-        "Fused Delivery Plan",
-        position="upper_left",
-        font_size=12,
-        color=(0.12, 0.18, 0.26),
-    )
+    plotter.add_text(title, position="upper_left", font_size=12, color=(0.12, 0.18, 0.26))
 
     saved_file: Optional[str] = None
     if save_path:
@@ -1546,12 +1646,262 @@ def render_fused_solution_map(
         else:
             plotter.show()
     else:
-        plotter.show(auto_close=False)
+        # 纯离屏导出时，直接截图，避免 show() 在某些环境下阻塞。
         if saved_file:
             plotter.screenshot(saved_file)
         plotter.close()
 
     return saved_file
+
+
+def _normalize_render_plan_modes(
+    render_plan: Union[bool, str, Sequence[str], None],
+) -> List[str]:
+    """将 render_plan 参数归一化为渲染模式列表。"""
+
+    if render_plan is None or render_plan is False:
+        return []
+    if render_plan is True:
+        return ["fused"]
+
+    if isinstance(render_plan, str):
+        raw_items: List[str] = []
+        for token in (
+            render_plan.replace("|", ",")
+            .replace(";", ",")
+            .replace("+", ",")
+            .replace("/", ",")
+            .split(",")
+        ):
+            token = token.strip()
+            if token:
+                raw_items.append(token)
+    elif isinstance(render_plan, Sequence):
+        raw_items = [str(x).strip() for x in render_plan if str(x).strip()]
+    else:
+        raise TypeError("render_plan must be bool/str/Sequence[str]/None")
+
+    alias_map: Dict[str, List[str]] = {
+        "fused": ["fused"],
+        "combined": ["fused"],
+        "plan": ["fused"],
+        "uav": ["uav"],
+        "drone": ["uav"],
+        "rider": ["rider"],
+        "courier": ["rider"],
+        "both": ["uav", "rider"],
+        "split": ["uav", "rider"],
+        "dual": ["uav", "rider"],
+        "all": ["fused", "uav", "rider"],
+        "full": ["fused", "uav", "rider"],
+        "none": [],
+        "融合": ["fused"],
+        "总图": ["fused"],
+        "无人机": ["uav"],
+        "骑手": ["rider"],
+        "双图": ["uav", "rider"],
+        "分图": ["uav", "rider"],
+        "全部": ["fused", "uav", "rider"],
+    }
+
+    modes: List[str] = []
+    for item in raw_items:
+        key = item.lower()
+        if key not in alias_map:
+            raise ValueError(
+                f"Unsupported render_plan token: {item}. "
+                "Supported: fused/uav/rider/both/all"
+            )
+        modes.extend(alias_map[key])
+
+    unique_modes: List[str] = []
+    seen = set()
+    for mode in modes:
+        if mode not in seen:
+            seen.add(mode)
+            unique_modes.append(mode)
+    return unique_modes
+
+
+def _resolve_render_output_paths(
+    render_save_path: Optional[str],
+    modes: List[str],
+) -> Dict[str, Optional[str]]:
+    """为每种渲染模式生成输出文件路径。"""
+
+    if not modes:
+        return {}
+
+    if not render_save_path:
+        return {mode: None for mode in modes}
+
+    target = Path(render_save_path).expanduser()
+    if len(modes) == 1:
+        return {modes[0]: str(target.resolve())}
+
+    if target.suffix:
+        parent = target.parent.resolve()
+        stem = target.stem
+        ext = target.suffix
+        parent.mkdir(parents=True, exist_ok=True)
+        return {mode: str((parent / f"{stem}_{mode}{ext}").resolve()) for mode in modes}
+
+    out_dir = target.resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return {mode: str((out_dir / f"fusion_plan_{mode}.png").resolve()) for mode in modes}
+
+
+def _render_mode_to_flags(mode: str) -> Tuple[bool, bool, str]:
+    """将渲染模式映射到路径图层开关。"""
+
+    if mode == "uav":
+        return True, False, "UAV Delivery Plan"
+    if mode == "rider":
+        return False, True, "Rider Delivery Plan"
+    return True, True, "Fused Delivery Plan"
+
+
+def render_fused_performance_plots(
+    solution: FusedModelSolution,
+    save_dir: Optional[str] = None,
+    show: bool = False,
+    file_prefix: str = "fusion_model",
+) -> Dict[str, str]:
+    """绘制融合模型性能图，便于与其他算法对比。"""
+
+    try:
+        import matplotlib
+
+        if not show:
+            matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise ImportError(
+            "render_fused_performance_plots 依赖 matplotlib，请先安装: pip install matplotlib"
+        ) from exc
+
+    output_dir: Optional[Path] = None
+    if save_dir:
+        output_dir = Path(save_dir).expanduser().resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+    elif not show:
+        output_dir = (Path.cwd() / "统一输出").resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    prefix = str(file_prefix).strip().replace(" ", "_") or "fusion_model"
+    saved_paths: Dict[str, str] = {}
+
+    def _finalize_figure(fig: Any, key: str, filename: str) -> None:
+        if output_dir is not None:
+            file_path = output_dir / filename
+            fig.savefig(file_path, dpi=180, bbox_inches="tight")
+            saved_paths[key] = str(file_path)
+        if show:
+            fig.show()
+        plt.close(fig)
+
+    report = solution.performance_report or {}
+    trace = report.get("generation_trace", [])
+    if isinstance(trace, list) and trace:
+        gens = np.array([int(row.get("generation", i + 1)) for i, row in enumerate(trace)], dtype=float)
+        best_total = np.array([float(row.get("best_weighted_total", np.nan)) for row in trace], dtype=float)
+        mean_total = np.array([float(row.get("mean_weighted_total", np.nan)) for row in trace], dtype=float)
+        feasible_ratio = np.array([float(row.get("feasible_ratio", np.nan)) for row in trace], dtype=float)
+        front0_size = np.array([float(row.get("front0_size", np.nan)) for row in trace], dtype=float)
+        best_f1 = np.array([float(row.get("best_f1", np.nan)) for row in trace], dtype=float)
+        best_f2 = np.array([float(row.get("best_f2", np.nan)) for row in trace], dtype=float)
+        best_f3 = np.array([float(row.get("best_f3", np.nan)) for row in trace], dtype=float)
+
+        fig1, ax1 = plt.subplots(figsize=(9.5, 5.4))
+        ax1.plot(gens, best_total, color="#d1495b", linewidth=2.0, label="Best Weighted Objective")
+        ax1.plot(gens, mean_total, color="#2a9d8f", linewidth=1.8, label="Mean Weighted Objective")
+        ax1.set_xlabel("Generation")
+        ax1.set_ylabel("Weighted Objective")
+        ax1.set_title("Optimization Convergence")
+        ax1.grid(alpha=0.28)
+        ax1.legend()
+        _finalize_figure(fig1, "convergence", f"{prefix}_convergence.png")
+
+        fig2, ax2 = plt.subplots(figsize=(9.5, 5.4))
+        ax2.plot(gens, best_f1, color="#ef476f", linewidth=2.0, label="f1: cost+makespan")
+        ax2.plot(gens, best_f2, color="#118ab2", linewidth=2.0, label="f2: late+open")
+        ax2.plot(gens, best_f3, color="#06d6a0", linewidth=2.0, label="f3: drone_cost")
+        ax2.set_xlabel("Generation")
+        ax2.set_ylabel("Objective Value")
+        ax2.set_title("Objective Evolution")
+        ax2.grid(alpha=0.28)
+        ax2.legend()
+        _finalize_figure(fig2, "objectives", f"{prefix}_objectives.png")
+
+        fig3, ax3 = plt.subplots(figsize=(9.5, 5.4))
+        ax3.plot(gens, feasible_ratio, color="#5e60ce", linewidth=2.0, label="Feasible Ratio")
+        ax3.set_xlabel("Generation")
+        ax3.set_ylabel("Feasible Ratio")
+        ax3.set_ylim(0.0, 1.05)
+        ax3.grid(alpha=0.28)
+        ax3_t = ax3.twinx()
+        ax3_t.plot(gens, front0_size, color="#f4a261", linewidth=1.8, linestyle="--", label="Front-0 Size")
+        ax3_t.set_ylabel("Front-0 Size")
+        lines1, labels1 = ax3.get_legend_handles_labels()
+        lines2, labels2 = ax3_t.get_legend_handles_labels()
+        ax3.legend(lines1 + lines2, labels1 + labels2, loc="best")
+        ax3.set_title("Feasibility And Pareto Pressure")
+        _finalize_figure(fig3, "feasibility", f"{prefix}_feasibility.png")
+
+    pareto = solution.pareto_front or []
+    pareto_obj: List[Tuple[float, float, float]] = []
+    for item in pareto:
+        vec = item.get("objective_vector")
+        if isinstance(vec, (list, tuple)) and len(vec) >= 3:
+            pareto_obj.append((float(vec[0]), float(vec[1]), float(vec[2])))
+
+    if pareto_obj:
+        arr = np.asarray(pareto_obj, dtype=float)
+        fig4, ax4 = plt.subplots(figsize=(8.8, 6.0))
+        sc = ax4.scatter(
+            arr[:, 0],
+            arr[:, 1],
+            c=arr[:, 2],
+            cmap="viridis",
+            s=34,
+            alpha=0.88,
+            edgecolors="none",
+        )
+        ax4.set_xlabel("f1: cost+makespan")
+        ax4.set_ylabel("f2: late+open")
+        ax4.set_title("Final Pareto Front (color=f3)")
+        ax4.grid(alpha=0.25)
+        cbar = fig4.colorbar(sc, ax=ax4)
+        cbar.set_label("f3: drone_cost")
+        _finalize_figure(fig4, "pareto", f"{prefix}_pareto_front.png")
+
+    components = solution.objective_components or {}
+    if components:
+        labels = list(components.keys())
+        values = np.array([float(components[k]) for k in labels], dtype=float)
+        fig5, ax5 = plt.subplots(figsize=(10.0, 5.6))
+        bars = ax5.bar(
+            np.arange(len(labels)),
+            values,
+            color=["#457b9d", "#f4a261", "#2a9d8f", "#e76f51", "#6d597a"][: len(labels)],
+        )
+        ax5.set_xticks(np.arange(len(labels)))
+        ax5.set_xticklabels(labels, rotation=24, ha="right")
+        ax5.set_ylabel("Value")
+        ax5.set_title("Final Objective Components")
+        ax5.grid(axis="y", alpha=0.25)
+        for bar, v in zip(bars, values):
+            ax5.text(
+                bar.get_x() + bar.get_width() / 2.0,
+                bar.get_height(),
+                f"{v:.2f}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
+        _finalize_figure(fig5, "components", f"{prefix}_objective_components.png")
+
+    return saved_paths
 
 
 class InfeasibleFusionPlanError(RuntimeError):
@@ -1668,11 +2018,13 @@ class DroneRiderFusionOptimizer:
         self.n_drones = int(n_drones)
         self.n_riders = int(n_riders)
         self.config = config if config is not None else FusionModelConfig()
+        self._rng = np.random.default_rng(self.config.ga_random_seed)
 
         self._uav_cost: Optional[np.ndarray] = None
         self._uav_time: Optional[np.ndarray] = None
         self._uav_energy: Optional[np.ndarray] = None
         self._order_candidate_score: Optional[np.ndarray] = None
+        self.last_performance_report: Optional[Dict[str, Any]] = None
 
     @staticmethod
     def _distance_2d(ax: float, ay: float, bx: float, by: float) -> float:
@@ -1682,6 +2034,25 @@ class DroneRiderFusionOptimizer:
     def _hours_from_distance(distance_m: float, speed_km_h: float) -> float:
         speed = max(1e-9, speed_km_h)
         return float((distance_m / 1000.0) / speed)
+
+    def _normalize_order_sequence(self, sequence: List[int]) -> List[int]:
+        """将任意序列修复为 0..n-1 的合法排列。"""
+
+        n_orders = len(self.orders)
+        seen = set()
+        normalized: List[int] = []
+        for x in sequence:
+            try:
+                oi = int(x)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= oi < n_orders and oi not in seen:
+                normalized.append(oi)
+                seen.add(oi)
+        for oi in range(n_orders):
+            if oi not in seen:
+                normalized.append(oi)
+        return normalized
 
     def _compute_uav_leg_metrics(self, merchant_idx: int, candidate_idx: int) -> Tuple[float, float, float]:
         merchant = self.merchants[merchant_idx]
@@ -1840,6 +2211,7 @@ class DroneRiderFusionOptimizer:
     def _assign_drones(
         self,
         assigned_candidate: List[int],
+        order_sequence: Optional[List[int]] = None,
     ) -> Tuple[List[int], List[float], List[float], Dict[int, List[int]], List[float]]:
         assert self._uav_cost is not None and self._uav_time is not None and self._uav_energy is not None
 
@@ -1852,7 +2224,10 @@ class DroneRiderFusionOptimizer:
         drone_energy_used = [0.0] * self.n_drones
         drone_order_indices: Dict[int, List[int]] = defaultdict(list)
 
-        sorted_orders = sorted(range(n_orders), key=lambda oi: self.orders[oi].earliest_time)
+        if order_sequence is None:
+            sorted_orders = sorted(range(n_orders), key=lambda oi: self.orders[oi].earliest_time)
+        else:
+            sorted_orders = self._normalize_order_sequence(order_sequence)
         for oi in sorted_orders:
             order = self.orders[oi]
             g = assigned_candidate[oi]
@@ -1979,6 +2354,7 @@ class DroneRiderFusionOptimizer:
         self,
         assigned_candidate: List[int],
         arrival_time: List[float],
+        order_sequence: Optional[List[int]] = None,
     ) -> Tuple[List[int], List[float], List[float], Dict[int, List[int]], float]:
         n_orders = len(self.orders)
         assigned_rider = [-1] * n_orders
@@ -1990,7 +2366,10 @@ class DroneRiderFusionOptimizer:
         rider_pos: List[Optional[Tuple[float, float]]] = [None] * self.n_riders
         rider_spatiotemporal_cost = 0.0
 
-        sorted_orders = sorted(range(n_orders), key=lambda oi: arrival_time[oi])
+        if order_sequence is None:
+            sorted_orders = sorted(range(n_orders), key=lambda oi: arrival_time[oi])
+        else:
+            sorted_orders = self._normalize_order_sequence(order_sequence)
         for oi in sorted_orders:
             order = self.orders[oi]
             g = assigned_candidate[oi]
@@ -2051,6 +2430,59 @@ class DroneRiderFusionOptimizer:
 
         return assigned_rider, delivery_time, lateness, rider_order_indices, float(rider_spatiotemporal_cost)
 
+    def _compute_cost_components(
+        self,
+        selected_candidates: List[int],
+        assigned_candidate: List[int],
+        assigned_drone: List[int],
+        delivery_time: List[float],
+        lateness: List[float],
+        rider_spatiotemporal_cost: float,
+    ) -> Dict[str, float]:
+        """计算统一的成本分量，供单目标和多目标复用。"""
+
+        assert self._uav_cost is not None and self._uav_energy is not None
+
+        drone_cost = 0.0
+        drone_energy = 0.0
+        for oi, order in enumerate(self.orders):
+            mi = int(order.merchant_idx)
+            if mi < 0 or mi >= len(self.merchants):
+                mi = 0
+            g = int(assigned_candidate[oi])
+            if 0 <= g < len(self.candidate_points):
+                drone_cost += float(self._uav_cost[mi, g])
+                drone_energy += float(self._uav_energy[mi, g])
+            else:
+                drone_cost += 1e6
+                drone_energy += 1e6
+
+        late_cost = self.config.late_penalty_coeff * float(sum(lateness))
+        open_cost = self.config.candidate_opening_cost * float(len(selected_candidates))
+        makespan = max(delivery_time) if delivery_time else 0.0
+
+        return {
+            "drone_cost": float(drone_cost),
+            "rider_spatiotemporal_cost": float(rider_spatiotemporal_cost),
+            "late_cost": float(late_cost),
+            "open_cost": float(open_cost),
+            "makespan": float(makespan),
+            "drone_energy": float(drone_energy),
+            "n_selected_candidates": float(len(selected_candidates)),
+            "n_assigned_drones": float(len(set(assigned_drone))),
+        }
+
+    def _weighted_total_from_components(self, components: Dict[str, float]) -> float:
+        """按原有加权方式计算单值总目标（用于兼容输出与打分）。"""
+
+        return float(
+            self.config.lambda_drone_cost * components["drone_cost"]
+            + self.config.lambda_rider_cost * components["rider_spatiotemporal_cost"]
+            + self.config.lambda_late_cost * components["late_cost"]
+            + self.config.lambda_open_cost * components["open_cost"]
+            + self.config.lambda_makespan * components["makespan"]
+        )
+
     def _evaluate_objective(
         self,
         selected_candidates: List[int],
@@ -2060,38 +2492,16 @@ class DroneRiderFusionOptimizer:
         lateness: List[float],
         rider_spatiotemporal_cost: float,
     ) -> Tuple[Dict[str, float], float]:
-        assert self._uav_cost is not None
-
-        drone_cost = 0.0
-        for oi, order in enumerate(self.orders):
-            mi = int(order.merchant_idx)
-            if mi < 0 or mi >= len(self.merchants):
-                mi = 0
-            g = assigned_candidate[oi]
-            drone_cost += float(self._uav_cost[mi, g])
-
-        late_cost = self.config.late_penalty_coeff * float(sum(lateness))
-        open_cost = self.config.candidate_opening_cost * float(len(selected_candidates))
-        makespan = max(delivery_time) if delivery_time else 0.0
-
-        weighted_total = (
-            self.config.lambda_drone_cost * drone_cost
-            + self.config.lambda_rider_cost * rider_spatiotemporal_cost
-            + self.config.lambda_late_cost * late_cost
-            + self.config.lambda_open_cost * open_cost
-            + self.config.lambda_makespan * makespan
+        components = self._compute_cost_components(
+            selected_candidates=selected_candidates,
+            assigned_candidate=assigned_candidate,
+            assigned_drone=assigned_drone,
+            delivery_time=delivery_time,
+            lateness=lateness,
+            rider_spatiotemporal_cost=rider_spatiotemporal_cost,
         )
-
-        components = {
-            "drone_cost": float(drone_cost),
-            "rider_spatiotemporal_cost": float(rider_spatiotemporal_cost),
-            "late_cost": float(late_cost),
-            "open_cost": float(open_cost),
-            "makespan": float(makespan),
-            "n_selected_candidates": float(len(selected_candidates)),
-            "n_assigned_drones": float(len(set(assigned_drone))),
-        }
-        return components, float(weighted_total)
+        weighted_total = self._weighted_total_from_components(components)
+        return components, weighted_total
 
     def _build_constraint_report(
         self,
@@ -2152,8 +2562,632 @@ class DroneRiderFusionOptimizer:
         report["all_constraints_ok"] = all(bool_values)
         return report
 
-    def solve(self) -> FusedModelSolution:
-        """执行融合求解并返回结构化结果。"""
+    def _build_order_plan(
+        self,
+        assigned_candidate: List[int],
+        assigned_drone: List[int],
+        assigned_rider: List[int],
+        depart_time: List[float],
+        arrival_time: List[float],
+        delivery_time: List[float],
+        lateness: List[float],
+    ) -> List[Dict[str, Any]]:
+        order_plan: List[Dict[str, Any]] = []
+        for oi, order in enumerate(self.orders):
+            order_plan.append(
+                {
+                    "order_index": oi,
+                    "order_id": order.order_id,
+                    "merchant_idx": int(order.merchant_idx),
+                    "customer_idx": int(order.customer_idx),
+                    "candidate_idx": int(assigned_candidate[oi]),
+                    "drone_idx": int(assigned_drone[oi]),
+                    "rider_idx": int(assigned_rider[oi]),
+                    "uav_depart_time_h": float(depart_time[oi]),
+                    "uav_arrival_time_h": float(arrival_time[oi]),
+                    "delivery_time_h": float(delivery_time[oi]),
+                    "lateness_h": float(lateness[oi]),
+                    "demand": float(order.demand),
+                }
+            )
+        return order_plan
+
+    def _candidate_load_from_assignment(self, assigned_candidate: List[int]) -> Dict[int, float]:
+        candidate_load: Dict[int, float] = defaultdict(float)
+        for oi, g in enumerate(assigned_candidate):
+            if 0 <= g < len(self.candidate_points):
+                candidate_load[int(g)] += float(self.orders[oi].demand)
+        return dict(candidate_load)
+
+    def _constraint_violation_value(
+        self,
+        selected_candidates: List[int],
+        assigned_candidate: List[int],
+        assigned_drone: List[int],
+        assigned_rider: List[int],
+        drone_order_indices: Dict[int, List[int]],
+        drone_energy_used: List[float],
+        depart_time: List[float],
+        arrival_time: List[float],
+        candidate_load: Dict[int, float],
+    ) -> float:
+        """连续化约束违反度（CV）。CV=0 表示可行。"""
+
+        cv = 0.0
+        selected_set = set(selected_candidates)
+        max_selected = max(1, int(self.config.max_selected_candidates))
+
+        cv += max(0.0, float(len(selected_candidates) - max_selected))
+
+        if np.isfinite(self.config.candidate_capacity):
+            for load in candidate_load.values():
+                cv += max(0.0, float(load - self.config.candidate_capacity))
+
+        for oi, order in enumerate(self.orders):
+            g = int(assigned_candidate[oi])
+            if g < 0 or g >= len(self.candidate_points):
+                cv += 1.0
+            elif g not in selected_set:
+                cv += 1.0
+            cv += max(0.0, float(order.demand - self.config.drone_capacity))
+            cv += max(0.0, float(order.demand - self.config.rider_capacity))
+
+        if np.isfinite(self.config.drone_energy_limit):
+            for e in drone_energy_used:
+                cv += max(0.0, float(e - self.config.drone_energy_limit))
+
+        for d in assigned_drone:
+            if d < 0:
+                cv += 1.0
+        for r in assigned_rider:
+            if r < 0:
+                cv += 1.0
+
+        for idxs in drone_order_indices.values():
+            if not idxs:
+                continue
+            idxs_sorted = sorted(idxs, key=lambda i: depart_time[i])
+            for pos in range(1, len(idxs_sorted)):
+                prev_idx = idxs_sorted[pos - 1]
+                curr_idx = idxs_sorted[pos]
+                required_gap = arrival_time[prev_idx] + self.config.drone_turnaround_time
+                cv += max(0.0, float(required_gap - depart_time[curr_idx]))
+
+        return float(cv)
+
+    def _repair_chromosome(
+        self, individual: NSGA2Individual
+    ) -> Tuple[List[int], List[int], List[int], List[int], Dict[int, float]]:
+        """修复三层染色体，保证基本可行性。"""
+
+        assert self._order_candidate_score is not None
+        n_orders = len(self.orders)
+        n_candidates = len(self.candidate_points)
+        max_selected = max(1, min(int(self.config.max_selected_candidates), n_candidates))
+
+        order_sequence = self._normalize_order_sequence(individual.order_sequence)
+
+        assignment: List[int] = []
+        for g in individual.candidate_assignment:
+            try:
+                gi = int(g)
+            except (TypeError, ValueError):
+                gi = 0
+            gi = int(np.clip(gi, 0, n_candidates - 1))
+            assignment.append(gi)
+        if len(assignment) < n_orders:
+            assignment.extend([0] * (n_orders - len(assignment)))
+        assignment = assignment[:n_orders]
+
+        open_bits: List[int] = []
+        for v in individual.candidate_open:
+            open_bits.append(1 if int(v) != 0 else 0)
+        if len(open_bits) < n_candidates:
+            open_bits.extend([0] * (n_candidates - len(open_bits)))
+        open_bits = open_bits[:n_candidates]
+
+        selected = [g for g, bit in enumerate(open_bits) if bit == 1]
+        if not selected:
+            selected = [int(np.argmin(np.mean(self._order_candidate_score, axis=0)))]
+
+        if len(selected) > max_selected:
+            # 优先保留当前承载订单多且评分更优的候选点
+            counts = {g: 0 for g in selected}
+            for g in assignment:
+                if g in counts:
+                    counts[g] += 1
+            selected = sorted(
+                selected,
+                key=lambda g: (-counts[g], float(np.mean(self._order_candidate_score[:, g]))),
+            )[:max_selected]
+
+        selected_set = set(selected)
+
+        for oi in range(n_orders):
+            if assignment[oi] not in selected_set:
+                best_g = min(selected, key=lambda g: float(self._order_candidate_score[oi, g]))
+                assignment[oi] = int(best_g)
+
+        candidate_load = self._candidate_load_from_assignment(assignment)
+
+        if np.isfinite(self.config.candidate_capacity):
+            cap = float(self.config.candidate_capacity)
+            overloaded = [g for g, load in candidate_load.items() if load > cap + 1e-9]
+            for g in overloaded:
+                if g not in selected_set:
+                    continue
+                order_ids = [oi for oi in range(n_orders) if assignment[oi] == g]
+                order_ids.sort(key=lambda oi: float(self.orders[oi].demand), reverse=True)
+                for oi in order_ids:
+                    if candidate_load.get(g, 0.0) <= cap + 1e-9:
+                        break
+                    demand = float(self.orders[oi].demand)
+                    feasible_targets = [
+                        t for t in selected
+                        if t != g and candidate_load.get(t, 0.0) + demand <= cap + 1e-9
+                    ]
+                    if not feasible_targets:
+                        continue
+                    best_t = min(feasible_targets, key=lambda t: float(self._order_candidate_score[oi, t]))
+                    assignment[oi] = int(best_t)
+                    candidate_load[g] = candidate_load.get(g, 0.0) - demand
+                    candidate_load[best_t] = candidate_load.get(best_t, 0.0) + demand
+
+        open_bits = [1 if g in selected_set else 0 for g in range(n_candidates)]
+        selected = sorted(selected_set)
+        candidate_load = self._candidate_load_from_assignment(assignment)
+        return order_sequence, assignment, open_bits, selected, candidate_load
+
+    def _evaluate_nsga2_individual(self, individual: NSGA2Individual) -> NSGA2Individual:
+        """评估单个 NSGA-II 个体。"""
+
+        assert self._uav_cost is not None and self._uav_time is not None and self._uav_energy is not None
+        assert self._order_candidate_score is not None
+
+        try:
+            order_sequence, assignment, open_bits, selected, candidate_load = self._repair_chromosome(individual)
+            individual.order_sequence = order_sequence
+            individual.candidate_assignment = assignment
+            individual.candidate_open = open_bits
+
+            assigned_drone, depart_time, arrival_time, drone_order_indices, drone_energy_used = self._assign_drones(
+                assignment, order_sequence=order_sequence
+            )
+            assigned_rider, delivery_time, lateness, rider_order_indices, rider_st_cost = self._assign_riders(
+                assignment, arrival_time, order_sequence=order_sequence
+            )
+
+            components = self._compute_cost_components(
+                selected_candidates=selected,
+                assigned_candidate=assignment,
+                assigned_drone=assigned_drone,
+                delivery_time=delivery_time,
+                lateness=lateness,
+                rider_spatiotemporal_cost=rider_st_cost,
+            )
+            weighted_total = self._weighted_total_from_components(components)
+
+            # 三目标：运输成本/效率、时窗惩罚+开站成本、能耗
+            f1 = float(
+                components["drone_cost"]
+                + components["rider_spatiotemporal_cost"]
+                + self.config.lambda_makespan * components["makespan"]
+            )
+            f2 = float(components["late_cost"] + components["open_cost"])
+            f3 = float(components["drone_energy"])
+
+            constraint_report = self._build_constraint_report(
+                selected_candidates=selected,
+                assigned_candidate=assignment,
+                assigned_drone=assigned_drone,
+                assigned_rider=assigned_rider,
+                drone_order_indices=drone_order_indices,
+                drone_energy_used=drone_energy_used,
+                depart_time=depart_time,
+                arrival_time=arrival_time,
+                candidate_load=candidate_load,
+            )
+            cv = self._constraint_violation_value(
+                selected_candidates=selected,
+                assigned_candidate=assignment,
+                assigned_drone=assigned_drone,
+                assigned_rider=assigned_rider,
+                drone_order_indices=drone_order_indices,
+                drone_energy_used=drone_energy_used,
+                depart_time=depart_time,
+                arrival_time=arrival_time,
+                candidate_load=candidate_load,
+            )
+
+            individual.objectives = (f1, f2, f3)
+            individual.cv = float(cv)
+            individual.decoded = {
+                "selected_candidates": selected,
+                "assigned_candidate": assignment,
+                "assigned_drone": assigned_drone,
+                "assigned_rider": assigned_rider,
+                "depart_time": depart_time,
+                "arrival_time": arrival_time,
+                "delivery_time": delivery_time,
+                "lateness": lateness,
+                "drone_order_indices": drone_order_indices,
+                "rider_order_indices": rider_order_indices,
+                "drone_energy_used": drone_energy_used,
+                "candidate_load": candidate_load,
+                "constraint_report": constraint_report,
+                "components": components,
+                "weighted_total": weighted_total,
+            }
+        except InfeasibleFusionPlanError:
+            individual.objectives = (1e12, 1e12, 1e12)
+            individual.cv = 1e9
+            individual.decoded = None
+
+        return individual
+
+    def _random_individual(self) -> NSGA2Individual:
+        n_orders = len(self.orders)
+        n_candidates = len(self.candidate_points)
+        max_selected = max(1, min(int(self.config.max_selected_candidates), n_candidates))
+        n_open = int(self._rng.integers(1, max_selected + 1))
+        selected = self._rng.choice(n_candidates, size=n_open, replace=False).tolist()
+
+        open_bits = [0] * n_candidates
+        for g in selected:
+            open_bits[int(g)] = 1
+
+        assignment = [int(self._rng.choice(selected)) for _ in range(n_orders)]
+        order_sequence = self._rng.permutation(n_orders).tolist()
+
+        return NSGA2Individual(
+            order_sequence=order_sequence,
+            candidate_assignment=assignment,
+            candidate_open=open_bits,
+        )
+
+    @staticmethod
+    def _clone_individual(individual: NSGA2Individual) -> NSGA2Individual:
+        return NSGA2Individual(
+            order_sequence=list(individual.order_sequence),
+            candidate_assignment=list(individual.candidate_assignment),
+            candidate_open=list(individual.candidate_open),
+            objectives=tuple(individual.objectives),
+            cv=float(individual.cv),
+            rank=int(individual.rank),
+            crowding_distance=float(individual.crowding_distance),
+            decoded=individual.decoded,
+        )
+
+    @staticmethod
+    def _is_feasible(individual: NSGA2Individual) -> bool:
+        return individual.cv <= 1e-9
+
+    def _constrained_dominates(self, a: NSGA2Individual, b: NSGA2Individual) -> bool:
+        a_feasible = self._is_feasible(a)
+        b_feasible = self._is_feasible(b)
+        if a_feasible and not b_feasible:
+            return True
+        if not a_feasible and b_feasible:
+            return False
+        if not a_feasible and not b_feasible:
+            return a.cv < b.cv - 1e-12
+
+        better_or_equal = True
+        strictly_better = False
+        for k in range(3):
+            if a.objectives[k] > b.objectives[k] + 1e-12:
+                better_or_equal = False
+                break
+            if a.objectives[k] < b.objectives[k] - 1e-12:
+                strictly_better = True
+        return better_or_equal and strictly_better
+
+    def _fast_nondominated_sort(self, population: List[NSGA2Individual]) -> List[List[int]]:
+        n = len(population)
+        dominates: List[List[int]] = [[] for _ in range(n)]
+        dominated_count = [0] * n
+        fronts: List[List[int]] = [[]]
+
+        for p in range(n):
+            for q in range(n):
+                if p == q:
+                    continue
+                if self._constrained_dominates(population[p], population[q]):
+                    dominates[p].append(q)
+                elif self._constrained_dominates(population[q], population[p]):
+                    dominated_count[p] += 1
+            if dominated_count[p] == 0:
+                population[p].rank = 0
+                fronts[0].append(p)
+
+        i = 0
+        while i < len(fronts) and fronts[i]:
+            next_front: List[int] = []
+            for p in fronts[i]:
+                for q in dominates[p]:
+                    dominated_count[q] -= 1
+                    if dominated_count[q] == 0:
+                        population[q].rank = i + 1
+                        next_front.append(q)
+            i += 1
+            if next_front:
+                fronts.append(next_front)
+
+        return fronts
+
+    def _assign_crowding_distance(self, population: List[NSGA2Individual], front: List[int]) -> None:
+        if not front:
+            return
+        for idx in front:
+            population[idx].crowding_distance = 0.0
+        if len(front) <= 2:
+            for idx in front:
+                population[idx].crowding_distance = float("inf")
+            return
+
+        n_obj = 3
+        for m in range(n_obj):
+            sorted_idx = sorted(front, key=lambda i: population[i].objectives[m])
+            population[sorted_idx[0]].crowding_distance = float("inf")
+            population[sorted_idx[-1]].crowding_distance = float("inf")
+
+            f_min = population[sorted_idx[0]].objectives[m]
+            f_max = population[sorted_idx[-1]].objectives[m]
+            denom = f_max - f_min
+            if abs(denom) <= 1e-12:
+                continue
+
+            for pos in range(1, len(sorted_idx) - 1):
+                i_prev = sorted_idx[pos - 1]
+                i_curr = sorted_idx[pos]
+                i_next = sorted_idx[pos + 1]
+                distance = (
+                    population[i_next].objectives[m] - population[i_prev].objectives[m]
+                ) / denom
+                population[i_curr].crowding_distance += float(distance)
+
+    def _tournament_pick(self, population: List[NSGA2Individual]) -> NSGA2Individual:
+        if len(population) == 1:
+            return population[0]
+
+        i, j = self._rng.choice(len(population), size=2, replace=False)
+        a = population[int(i)]
+        b = population[int(j)]
+
+        if a.rank < b.rank:
+            return a
+        if b.rank < a.rank:
+            return b
+        if a.crowding_distance > b.crowding_distance:
+            return a
+        if b.crowding_distance > a.crowding_distance:
+            return b
+        if a.cv < b.cv:
+            return a
+        if b.cv < a.cv:
+            return b
+        return a if self._rng.random() < 0.5 else b
+
+    def _order_crossover(self, p1: List[int], p2: List[int]) -> Tuple[List[int], List[int]]:
+        n = len(p1)
+        if n < 2:
+            return list(p1), list(p2)
+        left = int(self._rng.integers(0, n - 1))
+        right = int(self._rng.integers(left + 1, n + 1))
+
+        def _ox(a: List[int], b: List[int]) -> List[int]:
+            child = [-1] * n
+            segment = a[left:right]
+            child[left:right] = segment
+            fill = [x for x in b if x not in segment]
+            ptr = 0
+            for pos in range(n):
+                if child[pos] == -1:
+                    child[pos] = fill[ptr]
+                    ptr += 1
+            return child
+
+        return _ox(p1, p2), _ox(p2, p1)
+
+    def _segment_crossover(self, p1: List[int], p2: List[int]) -> Tuple[List[int], List[int]]:
+        n = len(p1)
+        if n < 2:
+            return list(p1), list(p2)
+        cut = int(self._rng.integers(1, n))
+        c1 = list(p1[:cut]) + list(p2[cut:])
+        c2 = list(p2[:cut]) + list(p1[cut:])
+        return c1, c2
+
+    def _uniform_bit_crossover(self, p1: List[int], p2: List[int]) -> Tuple[List[int], List[int]]:
+        c1: List[int] = []
+        c2: List[int] = []
+        for i in range(len(p1)):
+            if self._rng.random() < 0.5:
+                c1.append(int(p1[i]))
+                c2.append(int(p2[i]))
+            else:
+                c1.append(int(p2[i]))
+                c2.append(int(p1[i]))
+        return c1, c2
+
+    def _crossover(self, p1: NSGA2Individual, p2: NSGA2Individual) -> Tuple[NSGA2Individual, NSGA2Individual]:
+        if self._rng.random() > float(np.clip(self.config.ga_crossover_prob, 0.0, 1.0)):
+            return self._clone_individual(p1), self._clone_individual(p2)
+
+        o1, o2 = self._order_crossover(p1.order_sequence, p2.order_sequence)
+        d1, d2 = self._segment_crossover(p1.candidate_assignment, p2.candidate_assignment)
+        f1, f2 = self._uniform_bit_crossover(p1.candidate_open, p2.candidate_open)
+
+        c1 = NSGA2Individual(order_sequence=o1, candidate_assignment=d1, candidate_open=f1)
+        c2 = NSGA2Individual(order_sequence=o2, candidate_assignment=d2, candidate_open=f2)
+        return c1, c2
+
+    def _mutate(self, individual: NSGA2Individual) -> None:
+        if self._rng.random() > float(np.clip(self.config.ga_mutation_prob, 0.0, 1.0)):
+            return
+
+        n_orders = len(individual.order_sequence)
+        n_candidates = len(individual.candidate_open)
+        layer_prob = float(np.clip(self.config.ga_layer_mutation_prob, 0.0, 1.0))
+        mutated = False
+
+        if n_orders >= 2 and self._rng.random() < layer_prob:
+            a, b = self._rng.choice(n_orders, size=2, replace=False)
+            ia = int(a)
+            ib = int(b)
+            individual.order_sequence[ia], individual.order_sequence[ib] = (
+                individual.order_sequence[ib],
+                individual.order_sequence[ia],
+            )
+            mutated = True
+
+        if n_orders >= 1 and n_candidates >= 1 and self._rng.random() < layer_prob:
+            oi = int(self._rng.integers(0, n_orders))
+            gi = int(self._rng.integers(0, n_candidates))
+            individual.candidate_assignment[oi] = gi
+            mutated = True
+
+        if n_candidates >= 1 and self._rng.random() < layer_prob:
+            gi = int(self._rng.integers(0, n_candidates))
+            individual.candidate_open[gi] = 1 - int(individual.candidate_open[gi])
+            mutated = True
+
+        if not mutated and self.config.ga_force_mutation_if_none and n_candidates >= 1:
+            gi = int(self._rng.integers(0, n_candidates))
+            individual.candidate_open[gi] = 1 - int(individual.candidate_open[gi])
+
+    def _initialize_population(self) -> List[NSGA2Individual]:
+        pop_size = max(4, int(self.config.ga_population_size))
+        population: List[NSGA2Individual] = []
+        for _ in range(pop_size):
+            ind = self._random_individual()
+            self._evaluate_nsga2_individual(ind)
+            population.append(ind)
+        return population
+
+    def _environmental_selection(
+        self, merged_population: List[NSGA2Individual], target_size: int
+    ) -> List[NSGA2Individual]:
+        fronts = self._fast_nondominated_sort(merged_population)
+        new_pop: List[NSGA2Individual] = []
+
+        for front in fronts:
+            self._assign_crowding_distance(merged_population, front)
+            if len(new_pop) + len(front) <= target_size:
+                new_pop.extend(merged_population[idx] for idx in front)
+            else:
+                sorted_front = sorted(
+                    front,
+                    key=lambda idx: merged_population[idx].crowding_distance,
+                    reverse=True,
+                )
+                remain = target_size - len(new_pop)
+                new_pop.extend(merged_population[idx] for idx in sorted_front[:remain])
+                break
+
+        return new_pop
+
+    def _collect_generation_metrics(
+        self,
+        population: List[NSGA2Individual],
+        generation: int,
+        elapsed_sec: float,
+    ) -> Dict[str, float]:
+        """统计一代种群的性能指标。"""
+
+        if not population:
+            return {
+                "generation": float(generation),
+                "elapsed_sec": float(elapsed_sec),
+                "population_size": 0.0,
+                "feasible_count": 0.0,
+                "feasible_ratio": 0.0,
+                "front0_size": 0.0,
+                "best_weighted_total": float("inf"),
+                "mean_weighted_total": float("inf"),
+                "best_f1": float("inf"),
+                "best_f2": float("inf"),
+                "best_f3": float("inf"),
+            }
+
+        weighted_values: List[float] = []
+        objective_values: List[Tuple[float, float, float]] = []
+        feasible_flags: List[bool] = []
+
+        for ind in population:
+            if ind.decoded is None:
+                self._evaluate_nsga2_individual(ind)
+            decoded = ind.decoded if ind.decoded is not None else {}
+            weighted_values.append(float(decoded.get("weighted_total", float("inf"))))
+            objective_values.append(
+                (
+                    float(ind.objectives[0]),
+                    float(ind.objectives[1]),
+                    float(ind.objectives[2]),
+                )
+            )
+            feasible_flags.append(self._is_feasible(ind))
+
+        arr_w = np.asarray(weighted_values, dtype=float)
+        arr_obj = np.asarray(objective_values, dtype=float)
+        feasible_mask = np.asarray(feasible_flags, dtype=bool)
+
+        use_idx = np.where(feasible_mask)[0]
+        if use_idx.size == 0:
+            use_idx = np.arange(len(population))
+
+        use_w = arr_w[use_idx]
+        use_obj = arr_obj[use_idx, :]
+
+        fronts = self._fast_nondominated_sort(population)
+        front0_size = len(fronts[0]) if fronts else 0
+
+        return {
+            "generation": float(generation),
+            "elapsed_sec": float(elapsed_sec),
+            "population_size": float(len(population)),
+            "feasible_count": float(np.sum(feasible_mask)),
+            "feasible_ratio": float(np.mean(feasible_mask)),
+            "front0_size": float(front0_size),
+            "best_weighted_total": float(np.min(use_w)),
+            "mean_weighted_total": float(np.mean(use_w)),
+            "best_f1": float(np.min(use_obj[:, 0])),
+            "best_f2": float(np.min(use_obj[:, 1])),
+            "best_f3": float(np.min(use_obj[:, 2])),
+        }
+
+    def _make_solution_from_decoded(
+        self,
+        decoded: Dict[str, Any],
+        solver_mode: str,
+        objective_vector: Optional[Tuple[float, float, float]],
+        pareto_front: Optional[List[Dict[str, Any]]] = None,
+    ) -> FusedModelSolution:
+        order_plan = self._build_order_plan(
+            assigned_candidate=decoded["assigned_candidate"],
+            assigned_drone=decoded["assigned_drone"],
+            assigned_rider=decoded["assigned_rider"],
+            depart_time=decoded["depart_time"],
+            arrival_time=decoded["arrival_time"],
+            delivery_time=decoded["delivery_time"],
+            lateness=decoded["lateness"],
+        )
+
+        return FusedModelSolution(
+            selected_candidates=list(decoded["selected_candidates"]),
+            order_plan=order_plan,
+            drone_order_indices={int(k): list(v) for k, v in decoded["drone_order_indices"].items()},
+            rider_order_indices={int(k): list(v) for k, v in decoded["rider_order_indices"].items()},
+            objective_components=dict(decoded["components"]),
+            total_objective=float(decoded["weighted_total"]),
+            constraint_report=dict(decoded["constraint_report"]),
+            solver_mode=solver_mode,
+            objective_vector=objective_vector,
+            pareto_front=pareto_front,
+        )
+
+    def _solve_heuristic(self) -> FusedModelSolution:
+        """原有启发式单解流程（保持兼容）。"""
 
         self._build_uav_matrices()
         self._build_order_candidate_score_matrix()
@@ -2189,34 +3223,198 @@ class DroneRiderFusionOptimizer:
             candidate_load=candidate_load,
         )
 
-        order_plan: List[Dict[str, Any]] = []
-        for oi, order in enumerate(self.orders):
-            order_plan.append(
+        decoded = {
+            "selected_candidates": selected_candidates,
+            "assigned_candidate": assigned_candidate,
+            "assigned_drone": assigned_drone,
+            "assigned_rider": assigned_rider,
+            "depart_time": depart_time,
+            "arrival_time": arrival_time,
+            "delivery_time": delivery_time,
+            "lateness": lateness,
+            "drone_order_indices": drone_order_indices,
+            "rider_order_indices": rider_order_indices,
+            "drone_energy_used": drone_energy_used,
+            "candidate_load": candidate_load,
+            "constraint_report": constraint_report,
+            "components": components,
+            "weighted_total": total_objective,
+        }
+
+        objective_vector = (
+            float(
+                components["drone_cost"]
+                + components["rider_spatiotemporal_cost"]
+                + components["makespan"]
+            ),
+            float(components["late_cost"] + components["open_cost"]),
+            float(components["drone_cost"]),
+        )
+        feasible_flag = bool(constraint_report.get("all_constraints_ok", False))
+        self.last_performance_report = {
+            "solver_mode": "heuristic",
+            "population_size": 1.0,
+            "generations": 1.0,
+            "final_weighted_total": float(total_objective),
+            "final_objective_vector": objective_vector,
+            "generation_trace": [
                 {
-                    "order_index": oi,
-                    "order_id": order.order_id,
-                    "merchant_idx": int(order.merchant_idx),
-                    "customer_idx": int(order.customer_idx),
-                    "candidate_idx": int(assigned_candidate[oi]),
-                    "drone_idx": int(assigned_drone[oi]),
-                    "rider_idx": int(assigned_rider[oi]),
-                    "uav_depart_time_h": float(depart_time[oi]),
-                    "uav_arrival_time_h": float(arrival_time[oi]),
-                    "delivery_time_h": float(delivery_time[oi]),
-                    "lateness_h": float(lateness[oi]),
-                    "demand": float(order.demand),
+                    "generation": 1.0,
+                    "elapsed_sec": 0.0,
+                    "population_size": 1.0,
+                    "feasible_count": 1.0 if feasible_flag else 0.0,
+                    "feasible_ratio": 1.0 if feasible_flag else 0.0,
+                    "front0_size": 1.0,
+                    "best_weighted_total": float(total_objective),
+                    "mean_weighted_total": float(total_objective),
+                    "best_f1": float(objective_vector[0]),
+                    "best_f2": float(objective_vector[1]),
+                    "best_f3": float(objective_vector[2]),
+                }
+            ],
+        }
+
+        return self._make_solution_from_decoded(
+            decoded=decoded,
+            solver_mode="heuristic",
+            objective_vector=objective_vector,
+            pareto_front=None,
+        )
+
+    def _solve_nsga2(self) -> FusedModelSolution:
+        """改进 NSGA-II 多目标优化流程。"""
+
+        self._build_uav_matrices()
+        self._build_order_candidate_score_matrix()
+
+        pop_size = max(4, int(self.config.ga_population_size))
+        n_gen = max(1, int(self.config.ga_generations))
+
+        population = self._initialize_population()
+        generation_trace: List[Dict[str, float]] = []
+        start_ts = time.perf_counter()
+
+        for gen in range(n_gen):
+            fronts = self._fast_nondominated_sort(population)
+            for front in fronts:
+                self._assign_crowding_distance(population, front)
+
+            offspring: List[NSGA2Individual] = []
+            while len(offspring) < pop_size:
+                p1 = self._tournament_pick(population)
+                p2 = self._tournament_pick(population)
+
+                c1, c2 = self._crossover(p1, p2)
+                self._mutate(c1)
+                self._mutate(c2)
+
+                self._evaluate_nsga2_individual(c1)
+                offspring.append(c1)
+                if len(offspring) < pop_size:
+                    self._evaluate_nsga2_individual(c2)
+                    offspring.append(c2)
+
+            merged = population + offspring
+            population = self._environmental_selection(merged, pop_size)
+            generation_trace.append(
+                self._collect_generation_metrics(
+                    population=population,
+                    generation=gen + 1,
+                    elapsed_sec=time.perf_counter() - start_ts,
+                )
+            )
+
+            if self.config.ga_verbose and ((gen + 1) % 10 == 0 or gen == n_gen - 1):
+                feasible_cnt = sum(1 for ind in population if self._is_feasible(ind))
+                print(f"[NSGA-II] generation={gen + 1}/{n_gen}, feasible={feasible_cnt}/{len(population)}")
+
+        final_fronts = self._fast_nondominated_sort(population)
+        if not final_fronts or not final_fronts[0]:
+            # 理论上不会发生，兜底返回启发式
+            return self._solve_heuristic()
+
+        front0 = final_fronts[0]
+        feasible_front = [idx for idx in front0 if self._is_feasible(population[idx])]
+        candidate_front = feasible_front if feasible_front else front0
+
+        # 导出前沿时，基于最终候选前沿重算一次拥挤度，确保指标一致
+        self._assign_crowding_distance(population, candidate_front)
+
+        for idx in candidate_front:
+            if population[idx].decoded is None:
+                self._evaluate_nsga2_individual(population[idx])
+
+        obj_arr = np.array([population[idx].objectives for idx in candidate_front], dtype=float)
+        mins = np.min(obj_arr, axis=0)
+        maxs = np.max(obj_arr, axis=0)
+        span = np.where(maxs - mins <= 1e-12, 1.0, maxs - mins)
+
+        w1 = max(1e-9, self.config.lambda_drone_cost + self.config.lambda_rider_cost + self.config.lambda_makespan)
+        w2 = max(1e-9, self.config.lambda_late_cost + self.config.lambda_open_cost)
+        w3 = max(1e-9, self.config.lambda_drone_cost)
+        w = np.array([w1, w2, w3], dtype=float)
+        w /= np.sum(w)
+
+        best_idx = candidate_front[0]
+        best_score = float("inf")
+        for idx in candidate_front:
+            norm_obj = (np.array(population[idx].objectives, dtype=float) - mins) / span
+            score = float(np.dot(w, norm_obj))
+            if score < best_score:
+                best_score = score
+                best_idx = idx
+
+        best_ind = population[best_idx]
+        if best_ind.decoded is None:
+            self._evaluate_nsga2_individual(best_ind)
+        assert best_ind.decoded is not None
+
+        pareto_front: List[Dict[str, Any]] = []
+        for idx in candidate_front:
+            ind = population[idx]
+            if ind.decoded is None:
+                self._evaluate_nsga2_individual(ind)
+            selected_count = 0
+            weighted_total = float("inf")
+            if ind.decoded is not None:
+                selected_count = len(ind.decoded.get("selected_candidates", []))
+                weighted_total = float(ind.decoded.get("weighted_total", float("inf")))
+            pareto_front.append(
+                {
+                    "objective_vector": tuple(float(v) for v in ind.objectives),
+                    "constraint_violation": float(ind.cv),
+                    "rank": int(ind.rank),
+                    "crowding_distance": float(ind.crowding_distance),
+                    "weighted_total": weighted_total,
+                    "selected_candidates_count": int(selected_count),
                 }
             )
 
-        return FusedModelSolution(
-            selected_candidates=selected_candidates,
-            order_plan=order_plan,
-            drone_order_indices={int(k): list(v) for k, v in drone_order_indices.items()},
-            rider_order_indices={int(k): list(v) for k, v in rider_order_indices.items()},
-            objective_components=components,
-            total_objective=total_objective,
-            constraint_report=constraint_report,
+        self.last_performance_report = {
+            "solver_mode": "nsga2",
+            "population_size": float(pop_size),
+            "generations": float(n_gen),
+            "generation_trace": generation_trace,
+            "final_front_size": float(len(candidate_front)),
+            "selected_weighted_total": float(best_ind.decoded.get("weighted_total", float("inf"))),
+            "selected_objective_vector": tuple(float(v) for v in best_ind.objectives),
+        }
+
+        return self._make_solution_from_decoded(
+            decoded=best_ind.decoded,
+            solver_mode="nsga2",
+            objective_vector=tuple(float(v) for v in best_ind.objectives),
+            pareto_front=pareto_front,
         )
+
+    def solve(self) -> FusedModelSolution:
+        """执行融合求解并返回结构化结果。"""
+
+        self.last_performance_report = None
+        mode = str(self.config.solver_mode).strip().lower()
+        if mode in {"nsga2", "multi", "multi_objective", "multi-objective"}:
+            return self._solve_nsga2()
+        return self._solve_heuristic()
 
 
 def solve_fused_delivery_model(
@@ -2229,16 +3427,32 @@ def solve_fused_delivery_model(
     order_count: Optional[int] = None,
     random_seed: Optional[int] = 42,
     config: Optional[FusionModelConfig] = None,
-    render_plan: bool = False,
+    solver_mode: Optional[str] = None,
+    render_plan: Union[bool, str, Sequence[str]] = False,
     render_save_path: Optional[str] = None,
     render_show: bool = False,
+    render_performance: bool = False,
+    performance_save_dir: Optional[str] = None,
+    performance_show: bool = False,
+    performance_file_prefix: str = "fusion_model",
 ) -> FusedModelSolution:
     """融合模型的便捷入口函数。
 
     参数:
-        render_plan: 是否在求解后渲染路径规划图
-        render_save_path: 渲染图像输出路径（如 .png），为空则不落盘
-        render_show: 是否弹出交互窗口显示图像
+        render_plan:
+            是否渲染路径图；支持:
+            - bool: True=融合图，False=不渲染
+            - str: "fused"/"uav"/"rider"/"both"/"all"
+            - Sequence[str]: 例如 ["uav", "rider"]
+        render_save_path:
+            路径图输出路径；多图模式下:
+            - 若传文件名（含后缀），自动在文件名后追加 "_uav/_rider/_fused"
+            - 若传目录（不含后缀），写为 fusion_plan_*.png
+        render_show: 是否弹出交互窗口显示路径图
+        render_performance: 是否绘制性能对比图
+        performance_save_dir: 性能图输出目录，默认 `./统一输出`
+        performance_show: 是否弹出性能图窗口
+        performance_file_prefix: 性能图文件名前缀
     """
 
     orders = build_orders_from_customers(
@@ -2247,6 +3461,10 @@ def solve_fused_delivery_model(
         order_count=order_count,
         random_seed=random_seed,
     )
+    cfg = config if config is not None else FusionModelConfig()
+    if solver_mode is not None:
+        cfg.solver_mode = str(solver_mode)
+
     optimizer = DroneRiderFusionOptimizer(
         calculator=calculator,
         merchants=merchants,
@@ -2254,24 +3472,59 @@ def solve_fused_delivery_model(
         orders=orders,
         n_drones=n_drones,
         n_riders=n_riders,
-        config=config,
+        config=cfg,
     )
     solution = optimizer.solve()
+    if optimizer.last_performance_report is not None:
+        solution.performance_report = dict(optimizer.last_performance_report)
 
-    if render_plan or render_save_path:
-        render_fused_solution_map(
-            terrain=calculator.terrain,
-            obstacles=calculator.obstacles,
-            merchants=merchants,
-            customers=customers,
-            candidate_points=candidate_points,
+    render_modes = _normalize_render_plan_modes(render_plan)
+    if not render_modes and render_save_path:
+        render_modes = ["fused"]
+
+    if render_modes:
+        print(f"[Post] Rendering route maps: modes={render_modes}")
+        save_path_map = _resolve_render_output_paths(render_save_path, render_modes)
+        rendered_paths: Dict[str, str] = {}
+        for mode in render_modes:
+            t_render = time.perf_counter()
+            print(f"[Post] Start render mode={mode} ...")
+            show_uav, show_rider, title = _render_mode_to_flags(mode)
+            mode_save_path = save_path_map.get(mode)
+            saved = render_fused_solution_map(
+                terrain=calculator.terrain,
+                obstacles=calculator.obstacles,
+                merchants=merchants,
+                customers=customers,
+                candidate_points=candidate_points,
+                solution=solution,
+                save_path=mode_save_path,
+                show=(render_show or mode_save_path is None),
+                safe_clearance_height=optimizer.config.safe_clearance_height,
+                min_flight_height=optimizer.config.min_flight_height,
+                max_flight_height=optimizer.config.max_flight_height,
+                show_uav_paths=show_uav,
+                show_rider_paths=show_rider,
+                title=title,
+            )
+            print(f"[Post] Done render mode={mode}, elapsed={time.perf_counter() - t_render:.1f}s")
+            if saved:
+                rendered_paths[mode] = saved
+        if rendered_paths:
+            solution.rendered_plan_paths = rendered_paths
+
+    if render_performance or performance_save_dir:
+        t_perf = time.perf_counter()
+        print("[Post] Rendering performance plots ...")
+        performance_paths = render_fused_performance_plots(
             solution=solution,
-            save_path=render_save_path,
-            show=(render_show or render_save_path is None),
-            safe_clearance_height=optimizer.config.safe_clearance_height,
-            min_flight_height=optimizer.config.min_flight_height,
-            max_flight_height=optimizer.config.max_flight_height,
+            save_dir=performance_save_dir,
+            show=performance_show,
+            file_prefix=performance_file_prefix,
         )
+        print(f"[Post] Done performance plots, elapsed={time.perf_counter() - t_perf:.1f}s")
+        if performance_paths:
+            solution.performance_plot_paths = performance_paths
 
     return solution
 

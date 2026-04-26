@@ -2485,6 +2485,15 @@ def export_fused_solution_csv_reports(
         total_delivery_h = max(0.0, arrive_h - launch_h)
         uav_delivery_h = max(0.0, uav_arrive_h - uav_depart_h)
         rider_delivery_h = max(0.0, arrive_h - uav_arrive_h)
+        rider_only_h = 0.0
+
+        if 0 <= mi < len(merchants) and 0 <= ci < len(customers):
+            mx = float(merchants[mi].get("x", 0.0))
+            my = float(merchants[mi].get("y", 0.0))
+            cx = float(customers[ci].get("x", 0.0))
+            cy = float(customers[ci].get("y", 0.0))
+            rider_speed = max(1e-9, float(calculator.rider_speed))
+            rider_only_h = (sqrt((mx - cx) ** 2 + (my - cy) ** 2) / 1000.0) / rider_speed
 
         total_energy = 0.0
         if 0 <= mi < len(merchants) and 0 <= gi < len(candidate_points):
@@ -2499,6 +2508,7 @@ def export_fused_solution_csv_reports(
                 "总配送时间": round(total_delivery_h * 60.0, 4),
                 "无人机配送时间": round(uav_delivery_h * 60.0, 4),
                 "骑手配送时间": round(rider_delivery_h * 60.0, 4),
+                "仅骑手直送时间": round(rider_only_h * 60.0, 4),
                 "总能耗": round(total_energy, 4),
             }
         )
@@ -2514,6 +2524,7 @@ def export_fused_solution_csv_reports(
             "总配送时间",
             "无人机配送时间",
             "骑手配送时间",
+            "仅骑手直送时间",
             "总能耗",
         ],
         rows=order_rows,

@@ -194,6 +194,8 @@ class UAVPathCostCalculator:
         self.rider_speed = rider_speed
         self.drone_speed = drone_speed
 
+
+
         if obstacles:
             self._obs_x = np.array([obs.x for obs in obstacles], dtype=float)
             self._obs_y = np.array([obs.y for obs in obstacles], dtype=float)
@@ -986,10 +988,10 @@ def main() -> None:
                 order_count=120,
                 random_seed=42,
                 config=cfg,
-                render_plan=["uav", "rider"],
-                render_save_path=str(plan_path),
-                render_show=True,
-                render_performance=True,
+                # render_plan=["uav", "rider"],
+                # render_save_path=str(plan_path),
+                # render_show=True,
+                # render_performance=True,
                 performance_save_dir=str(output_dir),
                 performance_show=False,
                 performance_file_prefix="nsga2_compare",
@@ -1254,6 +1256,8 @@ class FusionModelConfig:
     path_obstacle_buffer_m: float = 20.0
     path_max_expand_nodes: int = 4000
     path_max_waypoints: int = 8
+    enable_near_order_rider_only: bool = True
+    near_order_rider_only_distance_m: float = 1000.0
 
 
 @dataclass
@@ -1369,7 +1373,7 @@ def _extract_solution_routes(
     """将最终规划结果转换为可绘制的无人机/骑手路径。"""
 
     routes: List[Dict[str, Any]] = []
-    if not candidate_points or not solution.order_plan:
+    if not solution.order_plan:
         return routes
 
     lift = max(0.5, float(rider_ground_lift))
@@ -1388,51 +1392,53 @@ def _extract_solution_routes(
 
         if not (0 <= merchant_idx < len(merchants)):
             continue
-        if not (0 <= candidate_idx < len(candidate_points)):
-            continue
 
         merchant = merchants[merchant_idx]
         mx = float(merchant.get("x", 0.0))
         my = float(merchant.get("y", 0.0))
-        gx, gy = candidate_points[candidate_idx]
-        gx = float(gx)
-        gy = float(gy)
 
         if 0 <= customer_idx < len(customers):
             customer = customers[customer_idx]
-            cx = float(customer.get("x", gx))
-            cy = float(customer.get("y", gy))
+            cx = float(customer.get("x", mx))
+            cy = float(customer.get("y", my))
         else:
-            cx, cy = gx, gy
+            cx, cy = mx, my
 
         mz = terrain.get_elevation(mx, my)
-        gz = terrain.get_elevation(gx, gy)
         cz = terrain.get_elevation(cx, cy)
+        uav_path: List[Tuple[float, float, float]] = []
 
-        cache_key = (merchant_idx, candidate_idx)
-        uav_path = uav_path_cache.get(cache_key)
-        if uav_path is None:
-            cruise = max(mz, gz) + float(safe_clearance_height)
-            cruise = float(np.clip(cruise, float(min_flight_height), float(max_flight_height)))
+        if 0 <= candidate_idx < len(candidate_points) and drone_idx >= 0:
+            gx, gy = candidate_points[candidate_idx]
+            gx = float(gx)
+            gy = float(gy)
+            gz = terrain.get_elevation(gx, gy)
 
-            start = (mx, my, mz)
-            end = (gx, gy, cruise)
-            inner_points = _search_uav_path_points(
-                calculator=search_calculator,
-                start=start,
-                end=end,
-                cruise=cruise,
-                enable_multi_waypoint_search=bool(enable_multi_waypoint_search),
-                grid_step_m=float(path_grid_step_m),
-                search_margin_m=float(path_search_margin_m),
-                obstacle_buffer_m=float(path_obstacle_buffer_m),
-                max_expand_nodes=int(path_max_expand_nodes),
-                max_waypoints=int(path_max_waypoints),
-            )
-            uav_path = [start] + inner_points + [end]
-            uav_path_cache[cache_key] = uav_path
+            cache_key = (merchant_idx, candidate_idx)
+            uav_path = uav_path_cache.get(cache_key)
+            if uav_path is None:
+                cruise = max(mz, gz) + float(safe_clearance_height)
+                cruise = float(np.clip(cruise, float(min_flight_height), float(max_flight_height)))
 
-        rider_path = [(gx, gy, gz + lift), (cx, cy, cz + lift)]
+                start = (mx, my, mz)
+                end = (gx, gy, cruise)
+                inner_points = _search_uav_path_points(
+                    calculator=search_calculator,
+                    start=start,
+                    end=end,
+                    cruise=cruise,
+                    enable_multi_waypoint_search=bool(enable_multi_waypoint_search),
+                    grid_step_m=float(path_grid_step_m),
+                    search_margin_m=float(path_search_margin_m),
+                    obstacle_buffer_m=float(path_obstacle_buffer_m),
+                    max_expand_nodes=int(path_max_expand_nodes),
+                    max_waypoints=int(path_max_waypoints),
+                )
+                uav_path = [start] + inner_points + [end]
+                uav_path_cache[cache_key] = uav_path
+            rider_path = [(gx, gy, gz + lift), (cx, cy, cz + lift)]
+        else:
+            rider_path = [(mx, my, mz + lift), (cx, cy, cz + lift)]
 
         routes.append(
             {
@@ -1581,8 +1587,10 @@ def render_fused_solution_map(
         drone_color = drone_palette[drone_idx % len(drone_palette)] if drone_idx >= 0 else drone_palette[0]
         rider_color = rider_palette[rider_idx % len(rider_palette)] if rider_idx >= 0 else rider_palette[0]
 
-        if show_uav_paths:
+        if show_uav_paths and drone_idx >= 0:
             uav_path = np.asarray(route["uav_path"], dtype=float)
+            if uav_path.ndim != 2 or uav_path.shape[0] < 2:
+                continue
             if uav_path.shape[0] >= 3:
                 drone_line = pv.Spline(uav_path, n_points=80)
             else:
@@ -1597,6 +1605,8 @@ def render_fused_solution_map(
 
         if show_rider_paths:
             rider_path = np.asarray(route["rider_path"], dtype=float)
+            if rider_path.ndim != 2 or rider_path.shape[0] < 2:
+                continue
             rider_line = pv.Line(rider_path[0], rider_path[-1], resolution=1)
             plotter.add_mesh(
                 rider_line,
@@ -2354,6 +2364,8 @@ def export_fused_solution_csv_reports(
     orders: List[DeliveryOrder],
     solution: FusedModelSolution,
     output_dir: Path,
+    rider_count_for_rider_only: Optional[int] = None,
+    rider_capacity_for_rider_only: float = float("inf"),
     safe_clearance_height: float = 20.0,
     min_flight_height: float = 20.0,
     max_flight_height: float = 120.0,
@@ -2457,6 +2469,78 @@ def export_fused_solution_csv_reports(
         rows=route_rows,
     )
 
+    def _simulate_rider_only_delivery_duration_h() -> List[float]:
+        """估计“仅骑手”运筹下每单从发起到送达的时长（小时）。"""
+
+        n_orders = len(orders)
+        if n_orders <= 0:
+            return []
+
+        if rider_count_for_rider_only is not None:
+            n_riders = max(1, int(rider_count_for_rider_only))
+        else:
+            used_riders = [int(k) for k in solution.rider_order_indices.keys()]
+            inferred = (max(used_riders) + 1) if used_riders else 1
+            n_riders = max(1, inferred)
+
+        rider_speed = max(1e-9, float(calculator.rider_speed))
+        rider_capacity = float(rider_capacity_for_rider_only)
+
+        finish_time_h = [float(order.earliest_time) for order in orders]
+        rider_available_h = [0.0] * n_riders
+        rider_pos_xy: List[Optional[Tuple[float, float]]] = [None] * n_riders
+
+        sorted_orders = sorted(range(n_orders), key=lambda oi: float(orders[oi].earliest_time))
+        for oi in sorted_orders:
+            order = orders[oi]
+            mi = int(order.merchant_idx)
+            if 0 <= mi < len(merchants):
+                mx = float(merchants[mi].get("x", 0.0))
+                my = float(merchants[mi].get("y", 0.0))
+            else:
+                mx = float(order.customer_x)
+                my = float(order.customer_y)
+
+            best_r = 0
+            best_finish = float("inf")
+            feasible_found = False
+
+            for r in range(n_riders):
+                if order.demand > rider_capacity + 1e-9:
+                    continue
+
+                pos = rider_pos_xy[r]
+                to_pickup_m = 0.0 if pos is None else sqrt((pos[0] - mx) ** 2 + (pos[1] - my) ** 2)
+                to_pickup_h = (to_pickup_m / 1000.0) / rider_speed
+
+                depart_h = max(rider_available_h[r] + to_pickup_h, float(order.earliest_time))
+                leg_m = sqrt((mx - order.customer_x) ** 2 + (my - order.customer_y) ** 2)
+                leg_h = (leg_m / 1000.0) / rider_speed
+                finish_h = depart_h + leg_h + float(order.service_time)
+
+                if finish_h < best_finish:
+                    best_finish = finish_h
+                    best_r = r
+                    feasible_found = True
+
+            if not feasible_found:
+                best_r = int(np.argmin(rider_available_h))
+                pos = rider_pos_xy[best_r]
+                to_pickup_m = 0.0 if pos is None else sqrt((pos[0] - mx) ** 2 + (pos[1] - my) ** 2)
+                to_pickup_h = (to_pickup_m / 1000.0) / rider_speed
+                depart_h = max(rider_available_h[best_r] + to_pickup_h, float(order.earliest_time))
+                leg_m = sqrt((mx - order.customer_x) ** 2 + (my - order.customer_y) ** 2)
+                leg_h = (leg_m / 1000.0) / rider_speed
+                best_finish = depart_h + leg_h + float(order.service_time)
+
+            finish_time_h[oi] = best_finish
+            rider_available_h[best_r] = best_finish
+            rider_pos_xy[best_r] = (float(order.customer_x), float(order.customer_y))
+
+        return [max(0.0, finish_time_h[oi] - float(orders[oi].earliest_time)) for oi in range(n_orders)]
+
+    rider_only_duration_h = _simulate_rider_only_delivery_duration_h()
+
     order_rows: List[Dict[str, Any]] = []
     for plan in solution.order_plan:
         oi = int(plan.get("order_index", -1))
@@ -2485,15 +2569,15 @@ def export_fused_solution_csv_reports(
         total_delivery_h = max(0.0, arrive_h - launch_h)
         uav_delivery_h = max(0.0, uav_arrive_h - uav_depart_h)
         rider_delivery_h = max(0.0, arrive_h - uav_arrive_h)
-        rider_only_h = 0.0
+        rider_only_h = rider_only_duration_h[oi] if oi < len(rider_only_duration_h) else 0.0
+        straight_distance_m = 0.0
 
         if 0 <= mi < len(merchants) and 0 <= ci < len(customers):
             mx = float(merchants[mi].get("x", 0.0))
             my = float(merchants[mi].get("y", 0.0))
             cx = float(customers[ci].get("x", 0.0))
             cy = float(customers[ci].get("y", 0.0))
-            rider_speed = max(1e-9, float(calculator.rider_speed))
-            rider_only_h = (sqrt((mx - cx) ** 2 + (my - cy) ** 2) / 1000.0) / rider_speed
+            straight_distance_m = sqrt((mx - cx) ** 2 + (my - cy) ** 2)
 
         total_energy = 0.0
         if 0 <= mi < len(merchants) and 0 <= gi < len(candidate_points):
@@ -2503,6 +2587,7 @@ def export_fused_solution_csv_reports(
             {
                 "起点": start_name,
                 "终点": end_name,
+                "直线距离": round(straight_distance_m, 4),
                 "订单发起时间": round(launch_h * 60.0, 4),
                 "到达时间": round(arrive_h * 60.0, 4),
                 "总配送时间": round(total_delivery_h * 60.0, 4),
@@ -2519,6 +2604,7 @@ def export_fused_solution_csv_reports(
         fieldnames=[
             "起点",
             "终点",
+            "直线距离",
             "订单发起时间",
             "到达时间",
             "总配送时间",
@@ -2658,6 +2744,8 @@ class DroneRiderFusionOptimizer:
         self._uav_energy: Optional[np.ndarray] = None
         self._order_candidate_score: Optional[np.ndarray] = None
         self.last_performance_report: Optional[Dict[str, Any]] = None
+        self._merchant_customer_distance_m = self._build_merchant_customer_distance_cache()
+        self._rider_only_flags = self._build_rider_only_flags()
 
     @staticmethod
     def _distance_2d(ax: float, ay: float, bx: float, by: float) -> float:
@@ -2667,6 +2755,48 @@ class DroneRiderFusionOptimizer:
     def _hours_from_distance(distance_m: float, speed_km_h: float) -> float:
         speed = max(1e-9, speed_km_h)
         return float((distance_m / 1000.0) / speed)
+
+    def _build_merchant_customer_distance_cache(self) -> List[float]:
+        distance_cache: List[float] = []
+        for order in self.orders:
+            mi = int(order.merchant_idx)
+            if mi < 0 or mi >= len(self.merchants):
+                mi = 0
+            merchant = self.merchants[mi]
+            mx = float(merchant.get("x", 0.0))
+            my = float(merchant.get("y", 0.0))
+            distance_cache.append(self._distance_2d(mx, my, order.customer_x, order.customer_y))
+        return distance_cache
+
+    def _build_rider_only_flags(self) -> List[bool]:
+        if not bool(self.config.enable_near_order_rider_only):
+            return [False] * len(self.orders)
+
+        threshold_m = max(0.0, float(self.config.near_order_rider_only_distance_m))
+        return [dist <= threshold_m + 1e-9 for dist in self._merchant_customer_distance_m]
+
+    def _is_rider_only_order(self, order_idx: int) -> bool:
+        if order_idx < 0 or order_idx >= len(self.orders):
+            return False
+        return bool(self._rider_only_flags[order_idx])
+
+    def _drone_order_indices(self) -> List[int]:
+        return [oi for oi in range(len(self.orders)) if not self._is_rider_only_order(oi)]
+
+    def _pickup_xy_for_order(self, order_idx: int, candidate_idx: int) -> Tuple[float, float]:
+        order = self.orders[order_idx]
+        if self._is_rider_only_order(order_idx):
+            mi = int(order.merchant_idx)
+            if mi < 0 or mi >= len(self.merchants):
+                mi = 0
+            merchant = self.merchants[mi]
+            return float(merchant.get("x", 0.0)), float(merchant.get("y", 0.0))
+
+        if 0 <= candidate_idx < len(self.candidate_points):
+            gx, gy = self.candidate_points[candidate_idx]
+            return float(gx), float(gy)
+
+        return float(order.customer_x), float(order.customer_y)
 
     def _normalize_order_sequence(self, sequence: List[int]) -> List[int]:
         """将任意序列修复为 0..n-1 的合法排列。"""
@@ -2776,7 +2906,12 @@ class DroneRiderFusionOptimizer:
             self._build_order_candidate_score_matrix()
 
         assert self._order_candidate_score is not None
-        no, ng = self._order_candidate_score.shape
+        drone_orders = self._drone_order_indices()
+        if not drone_orders:
+            return []
+
+        active_score = self._order_candidate_score[drone_orders, :]
+        no, ng = active_score.shape
         max_pick = max(1, min(self.config.max_selected_candidates, ng))
 
         selected: List[int] = []
@@ -2790,7 +2925,7 @@ class DroneRiderFusionOptimizer:
             best_vector = None
 
             for g in list(remaining):
-                v = np.minimum(current_best, self._order_candidate_score[:, g])
+                v = np.minimum(current_best, active_score[:, g])
                 total = float(np.sum(v)) + (
                     self.config.lambda_open_cost
                     * self.config.candidate_opening_cost
@@ -2814,7 +2949,7 @@ class DroneRiderFusionOptimizer:
             current_total = best_total
 
         if not selected:
-            selected = [0]
+            selected = [int(np.argmin(np.mean(active_score, axis=0)))]
         return selected
 
     def _assign_candidates(self, selected_candidates: List[int]) -> Tuple[List[int], Dict[int, float]]:
@@ -2822,10 +2957,18 @@ class DroneRiderFusionOptimizer:
             self._build_order_candidate_score_matrix()
         assert self._order_candidate_score is not None
 
+        if not selected_candidates and self._drone_order_indices():
+            best_default = int(np.argmin(np.mean(self._order_candidate_score[self._drone_order_indices(), :], axis=0)))
+            selected_candidates = [best_default]
+
         candidate_load = {g: 0.0 for g in selected_candidates}
         assigned_candidate = [-1] * len(self.orders)
 
         for oi, order in enumerate(self.orders):
+            if self._is_rider_only_order(oi):
+                assigned_candidate[oi] = -1
+                continue
+
             best_g = None
             best_score = float("inf")
             fallback_g = selected_candidates[0] if selected_candidates else -1
@@ -2842,11 +2985,12 @@ class DroneRiderFusionOptimizer:
                         f"No feasible candidate for order {order.order_id}: "
                         "candidate capacity is insufficient under current selected set."
                     )
-                chosen = fallback_g
+                chosen = fallback_g if fallback_g >= 0 else 0
             else:
                 chosen = best_g
 
             assigned_candidate[oi] = chosen
+            candidate_load.setdefault(chosen, 0.0)
             candidate_load[chosen] += float(order.demand)
 
         return assigned_candidate, candidate_load
@@ -2873,6 +3017,13 @@ class DroneRiderFusionOptimizer:
             sorted_orders = self._normalize_order_sequence(order_sequence)
         for oi in sorted_orders:
             order = self.orders[oi]
+            if self._is_rider_only_order(oi):
+                ready_time = float(order.earliest_time)
+                assigned_drone[oi] = -1
+                depart_time[oi] = ready_time
+                arrival_time[oi] = ready_time
+                continue
+
             g = assigned_candidate[oi]
             mi = int(order.merchant_idx)
             if mi < 0 or mi >= len(self.merchants):
@@ -2970,22 +3121,22 @@ class DroneRiderFusionOptimizer:
         self,
         prev_order_idx: Optional[int],
         current_order_idx: int,
-        candidate_idx: int,
+        pickup_x: float,
+        pickup_y: float,
     ) -> float:
         """计算骑手从上一个服务节点转移到当前订单的时空代价。"""
 
         current_order = self.orders[current_order_idx]
-        gx, gy = self.candidate_points[candidate_idx]
-        gx = float(gx)
-        gy = float(gy)
+        pickup_x = float(pickup_x)
+        pickup_y = float(pickup_y)
 
         if prev_order_idx is None:
-            spatial_m = self._distance_2d(gx, gy, current_order.customer_x, current_order.customer_y)
+            spatial_m = self._distance_2d(pickup_x, pickup_y, current_order.customer_x, current_order.customer_y)
             temporal_equiv_m = 0.0
         else:
             prev_order = self.orders[prev_order_idx]
-            reposition_m = self._distance_2d(prev_order.customer_x, prev_order.customer_y, gx, gy)
-            delivery_m = self._distance_2d(gx, gy, current_order.customer_x, current_order.customer_y)
+            reposition_m = self._distance_2d(prev_order.customer_x, prev_order.customer_y, pickup_x, pickup_y)
+            delivery_m = self._distance_2d(pickup_x, pickup_y, current_order.customer_x, current_order.customer_y)
             spatial_m = reposition_m + delivery_m
             temporal_h = self._temporal_distance_component(prev_order, current_order)
             temporal_equiv_m = temporal_h * self.calculator.rider_speed * 1000.0
@@ -3016,9 +3167,7 @@ class DroneRiderFusionOptimizer:
         for oi in sorted_orders:
             order = self.orders[oi]
             g = assigned_candidate[oi]
-            gx, gy = self.candidate_points[g]
-            gx = float(gx)
-            gy = float(gy)
+            pickup_x, pickup_y = self._pickup_xy_for_order(oi, g)
 
             best_r = 0
             best_finish = float("inf")
@@ -3030,11 +3179,11 @@ class DroneRiderFusionOptimizer:
                     continue
 
                 pos = rider_pos[r]
-                to_candidate_m = 0.0 if pos is None else self._distance_2d(pos[0], pos[1], gx, gy)
-                to_candidate_h = self._hours_from_distance(to_candidate_m, self.calculator.rider_speed)
-                depart = max(rider_available[r] + to_candidate_h, arrival_time[oi], order.earliest_time)
+                to_pickup_m = 0.0 if pos is None else self._distance_2d(pos[0], pos[1], pickup_x, pickup_y)
+                to_pickup_h = self._hours_from_distance(to_pickup_m, self.calculator.rider_speed)
+                depart = max(rider_available[r] + to_pickup_h, arrival_time[oi], order.earliest_time)
 
-                leg_m = self._distance_2d(gx, gy, order.customer_x, order.customer_y)
+                leg_m = self._distance_2d(pickup_x, pickup_y, order.customer_x, order.customer_y)
                 leg_h = self._hours_from_distance(leg_m, self.calculator.rider_speed)
                 finish = depart + leg_h + order.service_time
 
@@ -3052,10 +3201,10 @@ class DroneRiderFusionOptimizer:
                     )
                 best_r = int(np.argmin(rider_available))
                 pos = rider_pos[best_r]
-                to_candidate_m = 0.0 if pos is None else self._distance_2d(pos[0], pos[1], gx, gy)
-                to_candidate_h = self._hours_from_distance(to_candidate_m, self.calculator.rider_speed)
-                best_depart = max(rider_available[best_r] + to_candidate_h, arrival_time[oi], order.earliest_time)
-                leg_m = self._distance_2d(gx, gy, order.customer_x, order.customer_y)
+                to_pickup_m = 0.0 if pos is None else self._distance_2d(pos[0], pos[1], pickup_x, pickup_y)
+                to_pickup_h = self._hours_from_distance(to_pickup_m, self.calculator.rider_speed)
+                best_depart = max(rider_available[best_r] + to_pickup_h, arrival_time[oi], order.earliest_time)
+                leg_m = self._distance_2d(pickup_x, pickup_y, order.customer_x, order.customer_y)
                 leg_h = self._hours_from_distance(leg_m, self.calculator.rider_speed)
                 best_finish = best_depart + leg_h + order.service_time
 
@@ -3065,7 +3214,7 @@ class DroneRiderFusionOptimizer:
 
             previous_orders = rider_order_indices[best_r]
             prev_idx = previous_orders[-1] if previous_orders else None
-            rider_spatiotemporal_cost += self._rider_transition_cost(prev_idx, oi, g)
+            rider_spatiotemporal_cost += self._rider_transition_cost(prev_idx, oi, pickup_x, pickup_y)
 
             rider_order_indices[best_r].append(oi)
             rider_available[best_r] = best_finish
@@ -3089,6 +3238,9 @@ class DroneRiderFusionOptimizer:
         drone_cost = 0.0
         drone_energy = 0.0
         for oi, order in enumerate(self.orders):
+            if self._is_rider_only_order(oi):
+                continue
+
             mi = int(order.merchant_idx)
             if mi < 0 or mi >= len(self.merchants):
                 mi = 0
@@ -3112,7 +3264,7 @@ class DroneRiderFusionOptimizer:
             "makespan": float(makespan),
             "drone_energy": float(drone_energy),
             "n_selected_candidates": float(len(selected_candidates)),
-            "n_assigned_drones": float(len(set(assigned_drone))),
+            "n_assigned_drones": float(len({int(d) for d in assigned_drone if int(d) >= 0})),
         }
 
     def _weighted_total_from_components(self, components: Dict[str, float]) -> float:
@@ -3159,20 +3311,37 @@ class DroneRiderFusionOptimizer:
         candidate_load: Dict[int, float],
     ) -> Dict[str, Any]:
         report: Dict[str, Any] = {}
+        selected_set = set(int(g) for g in selected_candidates)
         report["candidate_limit_ok"] = len(selected_candidates) <= self.config.max_selected_candidates
-        report["all_orders_have_candidate"] = all(g >= 0 for g in assigned_candidate)
-        report["all_orders_have_drone"] = all(d >= 0 for d in assigned_drone)
+        report["all_orders_have_candidate"] = True
+        report["all_orders_have_drone"] = True
         report["all_orders_have_rider"] = all(r >= 0 for r in assigned_rider)
-        report["candidate_activation_ok"] = all(g in selected_candidates for g in assigned_candidate)
+        report["candidate_activation_ok"] = True
+        report["rider_only_rule_ok"] = True
         report["candidate_capacity_ok"] = all(
             load <= self.config.candidate_capacity + 1e-9 for load in candidate_load.values()
         )
 
         drone_capacity_ok = True
         for oi, order in enumerate(self.orders):
+            g = int(assigned_candidate[oi])
+            d = int(assigned_drone[oi])
+            rider_only = self._is_rider_only_order(oi)
+            if rider_only:
+                if g != -1 or d != -1:
+                    report["all_orders_have_candidate"] = False
+                    report["all_orders_have_drone"] = False
+                    report["rider_only_rule_ok"] = False
+                continue
+
+            if g < 0:
+                report["all_orders_have_candidate"] = False
+            if d < 0:
+                report["all_orders_have_drone"] = False
+            if g not in selected_set:
+                report["candidate_activation_ok"] = False
             if order.demand > self.config.drone_capacity + 1e-9:
                 drone_capacity_ok = False
-                break
         report["drone_capacity_ok"] = drone_capacity_ok
 
         rider_capacity_ok = True
@@ -3226,6 +3395,7 @@ class DroneRiderFusionOptimizer:
                     "candidate_idx": int(assigned_candidate[oi]),
                     "drone_idx": int(assigned_drone[oi]),
                     "rider_idx": int(assigned_rider[oi]),
+                    "delivery_mode": "rider_only" if self._is_rider_only_order(oi) else "uav_rider",
                     "uav_depart_time_h": float(depart_time[oi]),
                     "uav_arrival_time_h": float(arrival_time[oi]),
                     "delivery_time_h": float(delivery_time[oi]),
@@ -3267,21 +3437,28 @@ class DroneRiderFusionOptimizer:
                 cv += max(0.0, float(load - self.config.candidate_capacity))
 
         for oi, order in enumerate(self.orders):
+            rider_only = self._is_rider_only_order(oi)
             g = int(assigned_candidate[oi])
-            if g < 0 or g >= len(self.candidate_points):
-                cv += 1.0
-            elif g not in selected_set:
-                cv += 1.0
-            cv += max(0.0, float(order.demand - self.config.drone_capacity))
+            d = int(assigned_drone[oi])
+            if rider_only:
+                if g != -1:
+                    cv += 1.0
+                if d != -1:
+                    cv += 1.0
+            else:
+                if g < 0 or g >= len(self.candidate_points):
+                    cv += 1.0
+                elif g not in selected_set:
+                    cv += 1.0
+                if d < 0:
+                    cv += 1.0
+                cv += max(0.0, float(order.demand - self.config.drone_capacity))
             cv += max(0.0, float(order.demand - self.config.rider_capacity))
 
         if np.isfinite(self.config.drone_energy_limit):
             for e in drone_energy_used:
                 cv += max(0.0, float(e - self.config.drone_energy_limit))
 
-        for d in assigned_drone:
-            if d < 0:
-                cv += 1.0
         for r in assigned_rider:
             if r < 0:
                 cv += 1.0
@@ -3306,7 +3483,10 @@ class DroneRiderFusionOptimizer:
         assert self._order_candidate_score is not None
         n_orders = len(self.orders)
         n_candidates = len(self.candidate_points)
-        max_selected = max(1, min(int(self.config.max_selected_candidates), n_candidates))
+        drone_orders = self._drone_order_indices()
+        drone_order_set = set(drone_orders)
+        has_drone_orders = bool(drone_orders)
+        max_selected = max(1, min(int(self.config.max_selected_candidates), n_candidates)) if has_drone_orders else 0
 
         order_sequence = self._normalize_order_sequence(individual.order_sequence)
 
@@ -3324,42 +3504,56 @@ class DroneRiderFusionOptimizer:
 
         open_bits: List[int] = []
         for v in individual.candidate_open:
-            open_bits.append(1 if int(v) != 0 else 0)
+            try:
+                open_bits.append(1 if int(v) != 0 else 0)
+            except (TypeError, ValueError):
+                open_bits.append(0)
         if len(open_bits) < n_candidates:
             open_bits.extend([0] * (n_candidates - len(open_bits)))
         open_bits = open_bits[:n_candidates]
 
         selected = [g for g, bit in enumerate(open_bits) if bit == 1]
-        if not selected:
-            selected = [int(np.argmin(np.mean(self._order_candidate_score, axis=0)))]
+        if has_drone_orders and not selected:
+            active_mean = np.mean(self._order_candidate_score[drone_orders, :], axis=0)
+            selected = [int(np.argmin(active_mean))]
+        if not has_drone_orders:
+            selected = []
 
         if len(selected) > max_selected:
             # 优先保留当前承载订单多且评分更优的候选点
             counts = {g: 0 for g in selected}
-            for g in assignment:
-                if g in counts:
+            active_mean = np.mean(self._order_candidate_score[drone_orders, :], axis=0)
+            for oi, g in enumerate(assignment):
+                if oi in drone_order_set and g in counts:
                     counts[g] += 1
             selected = sorted(
                 selected,
-                key=lambda g: (-counts[g], float(np.mean(self._order_candidate_score[:, g]))),
+                key=lambda g: (-counts[g], float(active_mean[g])),
             )[:max_selected]
 
         selected_set = set(selected)
 
         for oi in range(n_orders):
+            if self._is_rider_only_order(oi):
+                assignment[oi] = -1
+                continue
+            if not selected_set:
+                best_g = int(np.argmin(self._order_candidate_score[oi, :]))
+                selected_set.add(best_g)
+                selected.append(best_g)
             if assignment[oi] not in selected_set:
-                best_g = min(selected, key=lambda g: float(self._order_candidate_score[oi, g]))
+                best_g = min(selected_set, key=lambda g: float(self._order_candidate_score[oi, g]))
                 assignment[oi] = int(best_g)
 
         candidate_load = self._candidate_load_from_assignment(assignment)
 
-        if np.isfinite(self.config.candidate_capacity):
+        if np.isfinite(self.config.candidate_capacity) and selected_set:
             cap = float(self.config.candidate_capacity)
             overloaded = [g for g, load in candidate_load.items() if load > cap + 1e-9]
             for g in overloaded:
                 if g not in selected_set:
                     continue
-                order_ids = [oi for oi in range(n_orders) if assignment[oi] == g]
+                order_ids = [oi for oi in range(n_orders) if assignment[oi] == g and not self._is_rider_only_order(oi)]
                 order_ids.sort(key=lambda oi: float(self.orders[oi].demand), reverse=True)
                 for oi in order_ids:
                     if candidate_load.get(g, 0.0) <= cap + 1e-9:
@@ -3471,15 +3665,26 @@ class DroneRiderFusionOptimizer:
     def _random_individual(self) -> NSGA2Individual:
         n_orders = len(self.orders)
         n_candidates = len(self.candidate_points)
-        max_selected = max(1, min(int(self.config.max_selected_candidates), n_candidates))
-        n_open = int(self._rng.integers(1, max_selected + 1))
-        selected = self._rng.choice(n_candidates, size=n_open, replace=False).tolist()
+        drone_orders = self._drone_order_indices()
+        max_selected = max(1, min(int(self.config.max_selected_candidates), n_candidates)) if drone_orders else 0
+        if max_selected > 0:
+            n_open = int(self._rng.integers(1, max_selected + 1))
+            selected = self._rng.choice(n_candidates, size=n_open, replace=False).tolist()
+        else:
+            selected = []
 
         open_bits = [0] * n_candidates
         for g in selected:
             open_bits[int(g)] = 1
 
-        assignment = [int(self._rng.choice(selected)) for _ in range(n_orders)]
+        assignment: List[int] = []
+        for oi in range(n_orders):
+            if self._is_rider_only_order(oi):
+                assignment.append(-1)
+            elif selected:
+                assignment.append(int(self._rng.choice(selected)))
+            else:
+                assignment.append(0)
         order_sequence = self._rng.permutation(n_orders).tolist()
 
         return NSGA2Individual(
@@ -4199,6 +4404,8 @@ def solve_fused_delivery_model(
             orders=orders,
             solution=solution,
             output_dir=tabular_dir,
+            rider_count_for_rider_only=optimizer.n_riders,
+            rider_capacity_for_rider_only=optimizer.config.rider_capacity,
             safe_clearance_height=optimizer.config.safe_clearance_height,
             min_flight_height=optimizer.config.min_flight_height,
             max_flight_height=optimizer.config.max_flight_height,

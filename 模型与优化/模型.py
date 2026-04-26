@@ -928,8 +928,9 @@ def main() -> None:
     project_root = Path(__file__).resolve().parents[1]
     merchant_csv = project_root / "数据" / "商家数据.csv"
     customer_csv = project_root / "数据" / "顾客数据.csv"
-    NSGA_OPTION = True #改进的遗传算法NSGA-II使用开关
-    
+    NSGA_OPTION = False #改进的遗传算法NSGA-II使用开关
+    CLASSIC_GA_OPTION = False #经典遗传算法使用开关
+    CLASSIC_NSGA_OPTION = True #传统NSGA算法使用开关
 
     if (
         terrain_csv.exists()
@@ -994,25 +995,121 @@ def main() -> None:
                 performance_show=False,
                 performance_file_prefix="nsga2_compare",
             )
+        elif CLASSIC_GA_OPTION:
+            # 经典遗传算法
+            print("Starting Classic Genetic Algorithm optimization...")
+            cfg = FusionModelConfig(
+                solver_mode="classic_ga",
+                ga_population_size=60,
+                ga_generations=120,
+                ga_verbose=True,
+                max_selected_candidates=6,
+                ga_random_seed=42,
+            )
+            output_dir = project_root / "统一输出"
+            plan_path = output_dir / "最终优化路径图.png"
 
-            print()
-            print(f"Solver mode: {solution.solver_mode}")
-            print(f"Objective vector (f1,f2,f3): {solution.objective_vector}")
-            print(f"Pareto size: {len(solution.pareto_front or [])}")
-            print(f"Constraints OK: {solution.constraint_report.get('all_constraints_ok')}")
-            print(f"Selected candidates: {solution.selected_candidates}")
-            if solution.rendered_plan_paths:
-                print("Rendered path maps:")
-                for mode, path in solution.rendered_plan_paths.items():
-                    print(f"  - {mode}: {path}")
-            if solution.performance_plot_paths:
-                print("Rendered performance plots:")
-                for name, path in solution.performance_plot_paths.items():
-                    print(f"  - {name}: {path}")
-            if solution.csv_output_paths:
-                print("Exported CSV reports:")
-                for name, path in solution.csv_output_paths.items():
-                    print(f"  - {name}: {path}")
+            solution = solve_fused_delivery_model(
+                calculator=calculator,
+                merchants=merchants,
+                customers=customers,
+                candidate_points=candidate_points,
+                n_drones=8, # 无人机数量
+                n_riders=20, # 骑手数量
+                order_count=120,
+                random_seed=42,
+                config=cfg,
+                # render_plan=["uav", "rider"],
+                # render_save_path=str(plan_path),
+                # render_show=True,
+                # render_performance=True,
+                performance_save_dir=str(output_dir),
+                performance_show=False,
+                performance_file_prefix="classic_ga_compare",
+            )
+        elif CLASSIC_NSGA_OPTION:
+            # 传统NSGA算法
+            print("Starting Classic NSGA optimization...")
+            cfg = FusionModelConfig(
+                solver_mode="classic_nsga",
+                ga_population_size=60,
+                ga_generations=120,
+                ga_verbose=True,
+                max_selected_candidates=6,
+                ga_random_seed=42,
+            )
+            output_dir = project_root / "统一输出"
+            plan_path = output_dir / "最终优化路径图.png"
+
+            solution = solve_fused_delivery_model(
+                calculator=calculator,
+                merchants=merchants,
+                customers=customers,
+                candidate_points=candidate_points,
+                n_drones=8, # 无人机数量
+                n_riders=20, # 骑手数量
+                order_count=120,
+                random_seed=42,
+                config=cfg,
+                # render_plan=["uav", "rider"],
+                # render_save_path=str(plan_path),
+                # render_show=True,
+                # render_performance=True,
+                performance_save_dir=str(output_dir),
+                performance_show=False,
+                performance_file_prefix="classic_nsga_compare",
+            )
+        else:
+            # 粒子群算法
+            print("Starting Particle Swarm Optimization...")
+            cfg = FusionModelConfig(
+                solver_mode="pso",
+                ga_population_size=60,
+                ga_generations=120,
+                ga_verbose=True,
+                max_selected_candidates=6,
+                ga_random_seed=42,
+            )
+            output_dir = project_root / "统一输出"
+            plan_path = output_dir / "最终优化路径图.png"
+
+            solution = solve_fused_delivery_model(
+                calculator=calculator,
+                merchants=merchants,
+                customers=customers,
+                candidate_points=candidate_points,
+                n_drones=8, # 无人机数量
+                n_riders=20, # 骑手数量
+                order_count=120,
+                random_seed=42,
+                config=cfg,
+                # render_plan=["uav", "rider"],
+                # render_save_path=str(plan_path),
+                # render_show=True,
+                # render_performance=True,
+                performance_save_dir=str(output_dir),
+                performance_show=False,
+                performance_file_prefix="pso_compare",
+            )
+
+        print()
+        print(f"Solver mode: {solution.solver_mode}")
+        print(f"Objective vector (f1,f2,f3): {solution.objective_vector}")
+        print(f"Pareto size: {len(solution.pareto_front or [])}")
+        print(f"Constraints OK: {solution.constraint_report.get('all_constraints_ok')}")
+        print(f"Selected candidates: {solution.selected_candidates}")
+        if solution.rendered_plan_paths:
+            print("Rendered path maps:")
+            for mode, path in solution.rendered_plan_paths.items():
+                print(f"  - {mode}: {path}")
+        if solution.performance_plot_paths:
+            print("Rendered performance plots:")
+            for name, path in solution.performance_plot_paths.items():
+                print(f"  - {name}: {path}")
+        if solution.csv_output_paths:
+            print("Exported CSV reports:")
+            for name, path in solution.csv_output_paths.items():
+                print(f"  - {name}: {path}")
                  
     else:
         print("Default real-data files are incomplete; fallback to demo data.")
@@ -2382,6 +2479,9 @@ def export_fused_solution_csv_reports(
     output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    import time
+    timestamp = time.strftime("_%Y%m%d_%H%M%S")
+
     selected_candidates: List[int] = []
     seen_candidates = set()
     for g in solution.selected_candidates:
@@ -2404,7 +2504,7 @@ def export_fused_solution_csv_reports(
             }
         )
 
-    selected_path = output_dir / "最终所选起降点列表.csv"
+    selected_path = output_dir / f"最终所选起降点列表{timestamp}.csv"
     _write_csv_rows(
         selected_path,
         fieldnames=["编号", "候选点索引", "X", "Y", "Z"],
@@ -2452,7 +2552,7 @@ def export_fused_solution_csv_reports(
                 }
             )
 
-    route_path = output_dir / "商家到所选起降点无人机运输路线结果.csv"
+    route_path = output_dir / f"商家到所选起降点无人机运输路线结果{timestamp}.csv"
     _write_csv_rows(
         route_path,
         fieldnames=[
@@ -2599,7 +2699,7 @@ def export_fused_solution_csv_reports(
             }
         )
 
-    order_path = output_dir / "模拟订单详细配送数据.csv"
+    order_path = output_dir / f"模拟订单详细配送数据{timestamp}.csv"
     _write_csv_rows(
         order_path,
         fieldnames=[
@@ -4263,6 +4363,420 @@ class DroneRiderFusionOptimizer:
             pareto_front=pareto_front,
         )
 
+    def _solve_classic_nsga(self) -> FusedModelSolution:
+        """传统 NSGA 多目标优化流程（无拥挤距离，仅基于Pareto秩和共享）。"""
+
+        self._build_uav_matrices()
+        self._build_order_candidate_score_matrix()
+
+        pop_size = max(4, int(self.config.ga_population_size))
+        n_gen = max(1, int(self.config.ga_generations))
+        sigma_share = pop_size // 4
+        epsilon = 0.01
+
+        population = self._initialize_population()
+        generation_trace: List[Dict[str, float]] = []
+        start_ts = time.perf_counter()
+
+        def _sharing_distance(a: NSGA2Individual, b: NSGA2Individual) -> float:
+            obj_arr = np.array([a.objectives, b.objectives], dtype=float)
+            if obj_arr.shape[0] < 2:
+                return 0.0
+            d = np.linalg.norm(obj_arr[0] - obj_arr[1])
+            return d
+
+        def _niche_count(ind: NSGA2Individual, pop: List[NSGA2Individual]) -> float:
+            count = 0.0
+            for other in pop:
+                if other is ind:
+                    continue
+                dist = _sharing_distance(ind, other)
+                if dist < sigma_share:
+                    count += 1.0 - (dist / sigma_share) ** epsilon
+            return count
+
+        for gen in range(n_gen):
+            fronts = self._fast_nondominated_sort(population)
+            for ind in population:
+                if ind.decoded is None:
+                    self._evaluate_nsga2_individual(ind)
+
+            offspring: List[NSGA2Individual] = []
+            while len(offspring) < pop_size:
+                p1 = self._tournament_pick(population)
+                p2 = self._tournament_pick(population)
+
+                c1, c2 = self._crossover(p1, p2)
+                self._mutate(c1)
+                self._mutate(c2)
+
+                self._evaluate_nsga2_individual(c1)
+                offspring.append(c1)
+                if len(offspring) < pop_size:
+                    self._evaluate_nsga2_individual(c2)
+                    offspring.append(c2)
+
+            merged = population + offspring
+            for ind in merged:
+                if ind.decoded is None:
+                    self._evaluate_nsga2_individual(ind)
+
+            merged_fronts = self._fast_nondominated_sort(merged)
+            new_pop: List[NSGA2Individual] = []
+
+            for front in merged_fronts:
+                if len(new_pop) + len(front) <= pop_size:
+                    new_pop.extend([merged[i] for i in front])
+                else:
+                    remaining = pop_size - len(new_pop)
+                    for idx in front:
+                        niche = _niche_count(merged[idx], [merged[i] for i in front])
+                        merged[idx].crowding_distance = 1.0 / (niche + 1.0)
+
+                    sorted_front = sorted(
+                        front,
+                        key=lambda i: merged[i].crowding_distance,
+                        reverse=True,
+                    )
+                    new_pop.extend([merged[i] for i in sorted_front[:remaining]])
+                    break
+
+            population = new_pop
+            generation_trace.append(
+                self._collect_generation_metrics(
+                    population=population,
+                    generation=gen + 1,
+                    elapsed_sec=time.perf_counter() - start_ts,
+                )
+            )
+
+            if self.config.ga_verbose and ((gen + 1) % 10 == 0 or gen == n_gen - 1):
+                feasible_cnt = sum(1 for ind in population if self._is_feasible(ind))
+                print(f"[Classic NSGA] generation={gen + 1}/{n_gen}, feasible={feasible_cnt}/{len(population)}")
+
+        final_fronts = self._fast_nondominated_sort(population)
+        if not final_fronts or not final_fronts[0]:
+            return self._solve_heuristic()
+
+        front0 = final_fronts[0]
+        feasible_front = [idx for idx in front0 if self._is_feasible(population[idx])]
+        candidate_front = feasible_front if feasible_front else front0
+
+        for idx in candidate_front:
+            if population[idx].decoded is None:
+                self._evaluate_nsga2_individual(population[idx])
+
+        obj_arr = np.array([population[idx].objectives for idx in candidate_front], dtype=float)
+        mins = np.min(obj_arr, axis=0)
+        maxs = np.max(obj_arr, axis=0)
+        span = np.where(maxs - mins <= 1e-12, 1.0, maxs - mins)
+
+        w1 = max(1e-9, self.config.lambda_drone_cost + self.config.lambda_rider_cost + self.config.lambda_makespan)
+        w2 = max(1e-9, self.config.lambda_late_cost + self.config.lambda_open_cost)
+        w3 = max(1e-9, self.config.lambda_drone_cost)
+        w = np.array([w1, w2, w3], dtype=float)
+        w /= np.sum(w)
+
+        best_idx = candidate_front[0]
+        best_score = float("inf")
+        for idx in candidate_front:
+            norm_obj = (np.array(population[idx].objectives, dtype=float) - mins) / span
+            score = float(np.dot(w, norm_obj))
+            if score < best_score:
+                best_score = score
+                best_idx = idx
+
+        best_ind = population[best_idx]
+        if best_ind.decoded is None:
+            self._evaluate_nsga2_individual(best_ind)
+        assert best_ind.decoded is not None
+
+        pareto_front: List[Dict[str, Any]] = []
+        for idx in candidate_front:
+            ind = population[idx]
+            if ind.decoded is None:
+                self._evaluate_nsga2_individual(ind)
+            selected_count = 0
+            weighted_total = float("inf")
+            if ind.decoded is not None:
+                selected_count = len(ind.decoded.get("selected_candidates", []))
+                weighted_total = float(ind.decoded.get("weighted_total", float("inf")))
+            pareto_front.append(
+                {
+                    "objective_vector": tuple(float(v) for v in ind.objectives),
+                    "constraint_violation": float(ind.cv),
+                    "rank": int(ind.rank),
+                    "crowding_distance": float(ind.crowding_distance),
+                    "weighted_total": weighted_total,
+                    "selected_candidates_count": int(selected_count),
+                }
+            )
+
+        self.last_performance_report = {
+            "solver_mode": "classic_nsga",
+            "population_size": float(pop_size),
+            "generations": float(n_gen),
+            "generation_trace": generation_trace,
+            "final_front_size": float(len(candidate_front)),
+            "selected_weighted_total": float(best_ind.decoded.get("weighted_total", float("inf"))),
+            "selected_objective_vector": tuple(float(v) for v in best_ind.objectives),
+        }
+
+        return self._make_solution_from_decoded(
+            decoded=best_ind.decoded,
+            solver_mode="classic_nsga",
+            objective_vector=tuple(float(v) for v in best_ind.objectives),
+            pareto_front=pareto_front,
+        )
+
+    def _solve_classic_ga(self) -> FusedModelSolution:
+        """经典遗传算法优化流程。"""
+        
+        self._build_uav_matrices()
+        self._build_order_candidate_score_matrix()
+        
+        pop_size = max(4, int(self.config.ga_population_size))
+        n_gen = max(1, int(self.config.ga_generations))
+        
+        # 初始化种群
+        population = []
+        for _ in range(pop_size):
+            ind = self._random_individual()
+            self._evaluate_nsga2_individual(ind)
+            population.append(ind)
+        
+        generation_trace: List[Dict[str, float]] = []
+        start_ts = time.perf_counter()
+        
+        for gen in range(n_gen):
+            # 评估种群
+            for ind in population:
+                if ind.decoded is None:
+                    self._evaluate_nsga2_individual(ind)
+            
+            # 选择（基于单目标适应度）
+            fitness = [float(ind.decoded.get("weighted_total", float("inf"))) for ind in population]
+            selected = []
+            for _ in range(pop_size):
+                # 轮盘赌选择
+                weights = [1.0 / (f + 1e-9) for f in fitness]
+                total_weight = sum(weights)
+                r = self._rng.random() * total_weight
+                current = 0
+                for i, w in enumerate(weights):
+                    current += w
+                    if current >= r:
+                        selected.append(population[i])
+                        break
+            
+            # 交叉
+            offspring = []
+            for i in range(0, pop_size, 2):
+                if i + 1 < pop_size:
+                    p1 = selected[i]
+                    p2 = selected[i+1]
+                    c1, c2 = self._crossover(p1, p2)
+                    offspring.extend([c1, c2])
+                else:
+                    offspring.append(selected[i])
+            
+            # 变异
+            for ind in offspring:
+                self._mutate(ind)
+                self._evaluate_nsga2_individual(ind)
+            
+            # 替换
+            population = offspring
+            
+            # 收集指标
+            generation_trace.append(
+                self._collect_generation_metrics(
+                    population=population,
+                    generation=gen + 1,
+                    elapsed_sec=time.perf_counter() - start_ts,
+                )
+            )
+            
+            if self.config.ga_verbose and ((gen + 1) % 10 == 0 or gen == n_gen - 1):
+                feasible_cnt = sum(1 for ind in population if self._is_feasible(ind))
+                print(f"[Classic GA] generation={gen + 1}/{n_gen}, feasible={feasible_cnt}/{len(population)}")
+        
+        # 选择最优个体
+        best_ind = min(population, key=lambda ind: float(ind.decoded.get("weighted_total", float("inf")))
+                      if ind.decoded is not None else float("inf"))
+        
+        if best_ind.decoded is None:
+            # 兜底返回启发式
+            return self._solve_heuristic()
+        
+        self.last_performance_report = {
+            "solver_mode": "classic_ga",
+            "population_size": float(pop_size),
+            "generations": float(n_gen),
+            "generation_trace": generation_trace,
+            "final_weighted_total": float(best_ind.decoded.get("weighted_total", float("inf"))),
+        }
+        
+        return self._make_solution_from_decoded(
+            decoded=best_ind.decoded,
+            solver_mode="classic_ga",
+            objective_vector=None,
+            pareto_front=None,
+        )
+
+    def _solve_pso(self) -> FusedModelSolution:
+        """粒子群算法优化流程。"""
+        
+        self._build_uav_matrices()
+        self._build_order_candidate_score_matrix()
+        
+        pop_size = max(4, int(self.config.ga_population_size))
+        n_gen = max(1, int(self.config.ga_generations))
+        
+        # 粒子类
+        class PSOParticle:
+            def __init__(self, optimizer):
+                self.optimizer = optimizer
+                self.individual = optimizer._random_individual()
+                self.optimizer._evaluate_nsga2_individual(self.individual)
+                self.fitness = float(self.individual.decoded.get("weighted_total", float("inf")))
+                self.pbest = self.individual
+                self.pbest_fitness = self.fitness
+                self.velocity = {
+                    "order_sequence": [0.0] * len(self.individual.order_sequence),
+                    "candidate_assignment": [0.0] * len(self.individual.candidate_assignment),
+                    "candidate_open": [0.0] * len(self.individual.candidate_open)
+                }
+            
+            def update_velocity(self, gbest, w=0.7, c1=1.4, c2=1.4):
+                r1 = self.optimizer._rng.random()
+                r2 = self.optimizer._rng.random()
+                
+                # 更新order_sequence速度
+                for i in range(len(self.velocity["order_sequence"])):
+                    self.velocity["order_sequence"][i] = (
+                        w * self.velocity["order_sequence"][i] +
+                        c1 * r1 * (self.pbest.order_sequence[i] - self.individual.order_sequence[i]) +
+                        c2 * r2 * (gbest.order_sequence[i] - self.individual.order_sequence[i])
+                    )
+                
+                # 更新candidate_assignment速度
+                for i in range(len(self.velocity["candidate_assignment"])):
+                    self.velocity["candidate_assignment"][i] = (
+                        w * self.velocity["candidate_assignment"][i] +
+                        c1 * r1 * (self.pbest.candidate_assignment[i] - self.individual.candidate_assignment[i]) +
+                        c2 * r2 * (gbest.candidate_assignment[i] - self.individual.candidate_assignment[i])
+                    )
+                
+                # 更新candidate_open速度
+                for i in range(len(self.velocity["candidate_open"])):
+                    self.velocity["candidate_open"][i] = (
+                        w * self.velocity["candidate_open"][i] +
+                        c1 * r1 * (self.pbest.candidate_open[i] - self.individual.candidate_open[i]) +
+                        c2 * r2 * (gbest.candidate_open[i] - self.individual.candidate_open[i])
+                    )
+            
+            def update_position(self):
+                # 更新order_sequence
+                new_order = self.individual.order_sequence.copy()
+                for i in range(len(new_order)):
+                    new_order[i] += self.velocity["order_sequence"][i]
+                    new_order[i] = max(0, min(len(new_order)-1, int(new_order[i])))
+                # 确保顺序唯一
+                new_order = self._unique_order(new_order)
+                self.individual.order_sequence = new_order
+                
+                # 更新candidate_assignment
+                for i in range(len(self.individual.candidate_assignment)):
+                    new_val = self.individual.candidate_assignment[i] + self.velocity["candidate_assignment"][i]
+                    self.individual.candidate_assignment[i] = max(0, min(len(self.individual.candidate_open)-1, int(new_val)))
+                
+                # 更新candidate_open
+                for i in range(len(self.individual.candidate_open)):
+                    new_val = self.individual.candidate_open[i] + self.velocity["candidate_open"][i]
+                    self.individual.candidate_open[i] = 1 if new_val > 0.5 else 0
+                
+                # 重新评估
+                self.optimizer._evaluate_nsga2_individual(self.individual)
+                self.fitness = float(self.individual.decoded.get("weighted_total", float("inf")))
+                
+                # 更新个人最优
+                if self.fitness < self.pbest_fitness:
+                    self.pbest = self.optimizer._clone_individual(self.individual)
+                    self.pbest_fitness = self.fitness
+            
+            def _unique_order(self, order):
+                # 确保顺序唯一
+                unique = list(set(order))
+                if len(unique) < len(order):
+                    # 填充缺失的值
+                    all_vals = set(range(len(order)))
+                    missing = list(all_vals - set(unique))
+                    self.optimizer._rng.shuffle(missing)
+                    unique.extend(missing[:len(order)-len(unique)])
+                # 打乱顺序以增加多样性
+                self.optimizer._rng.shuffle(unique)
+                return unique[:len(order)]
+        
+        # 初始化粒子群
+        particles = [PSOParticle(self) for _ in range(pop_size)]
+        
+        # 找到全局最优
+        gbest = min(particles, key=lambda p: p.fitness).pbest
+        gbest_fitness = min(particles, key=lambda p: p.fitness).fitness
+        
+        generation_trace: List[Dict[str, float]] = []
+        start_ts = time.perf_counter()
+        
+        for gen in range(n_gen):
+            # 更新每个粒子
+            for particle in particles:
+                particle.update_velocity(gbest)
+                particle.update_position()
+            
+            # 更新全局最优
+            current_best = min(particles, key=lambda p: p.fitness)
+            if current_best.fitness < gbest_fitness:
+                gbest = current_best.pbest
+                gbest_fitness = current_best.fitness
+            
+            # 收集指标
+            population = [p.individual for p in particles]
+            generation_trace.append(
+                self._collect_generation_metrics(
+                    population=population,
+                    generation=gen + 1,
+                    elapsed_sec=time.perf_counter() - start_ts,
+                )
+            )
+            
+            if self.config.ga_verbose and ((gen + 1) % 10 == 0 or gen == n_gen - 1):
+                feasible_cnt = sum(1 for p in particles if self._is_feasible(p.individual))
+                print(f"[PSO] generation={gen + 1}/{n_gen}, feasible={feasible_cnt}/{len(particles)}, best_fitness={gbest_fitness:.2f}")
+        
+        # 确保gbest已评估
+        if gbest.decoded is None:
+            self._evaluate_nsga2_individual(gbest)
+        
+        if gbest.decoded is None:
+            # 兜底返回启发式
+            return self._solve_heuristic()
+        
+        self.last_performance_report = {
+            "solver_mode": "pso",
+            "population_size": float(pop_size),
+            "generations": float(n_gen),
+            "generation_trace": generation_trace,
+            "final_weighted_total": float(gbest.decoded.get("weighted_total", float("inf"))),
+        }
+        
+        return self._make_solution_from_decoded(
+            decoded=gbest.decoded,
+            solver_mode="pso",
+            objective_vector=None,
+            pareto_front=None,
+        )
+
     def solve(self) -> FusedModelSolution:
         """执行融合求解并返回结构化结果。"""
 
@@ -4270,6 +4784,12 @@ class DroneRiderFusionOptimizer:
         mode = str(self.config.solver_mode).strip().lower()
         if mode in {"nsga2", "multi", "multi_objective", "multi-objective"}:
             return self._solve_nsga2()
+        elif mode in {"classic_nsga", "nsga"}:
+            return self._solve_classic_nsga()
+        elif mode in {"classic_ga", "ga", "genetic"}:
+            return self._solve_classic_ga()
+        elif mode in {"pso", "particle_swarm"}:
+            return self._solve_pso()
         return self._solve_heuristic()
 
 

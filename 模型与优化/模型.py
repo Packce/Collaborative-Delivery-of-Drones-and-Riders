@@ -194,8 +194,6 @@ class UAVPathCostCalculator:
         self.rider_speed = rider_speed
         self.drone_speed = drone_speed
 
-
-
         if obstacles:
             self._obs_x = np.array([obs.x for obs in obstacles], dtype=float)
             self._obs_y = np.array([obs.y for obs in obstacles], dtype=float)
@@ -983,8 +981,8 @@ def main() -> None:
                 merchants=merchants,
                 customers=customers,
                 candidate_points=candidate_points,
-                n_drones=8,
-                n_riders=20,
+                n_drones=8, # 无人机数量
+                n_riders=20, # 骑手数量
                 order_count=120,
                 random_seed=42,
                 config=cfg,
@@ -1258,6 +1256,8 @@ class FusionModelConfig:
     path_max_waypoints: int = 8
     enable_near_order_rider_only: bool = True
     near_order_rider_only_distance_m: float = 1000.0
+    rider_speed_cooperative_kmh: float = 30.0
+    rider_speed_rider_only_kmh: float = 12.0
 
 
 @dataclass
@@ -2366,6 +2366,7 @@ def export_fused_solution_csv_reports(
     output_dir: Path,
     rider_count_for_rider_only: Optional[int] = None,
     rider_capacity_for_rider_only: float = float("inf"),
+    rider_speed_for_rider_only_kmh: float = 15.0,
     safe_clearance_height: float = 20.0,
     min_flight_height: float = 20.0,
     max_flight_height: float = 120.0,
@@ -2483,7 +2484,7 @@ def export_fused_solution_csv_reports(
             inferred = (max(used_riders) + 1) if used_riders else 1
             n_riders = max(1, inferred)
 
-        rider_speed = max(1e-9, float(calculator.rider_speed))
+        rider_speed = max(1e-9, float(rider_speed_for_rider_only_kmh))
         rider_capacity = float(rider_capacity_for_rider_only)
 
         finish_time_h = [float(order.earliest_time) for order in orders]
@@ -2755,6 +2756,11 @@ class DroneRiderFusionOptimizer:
     def _hours_from_distance(distance_m: float, speed_km_h: float) -> float:
         speed = max(1e-9, speed_km_h)
         return float((distance_m / 1000.0) / speed)
+
+    def _cooperative_rider_speed(self) -> float:
+        """协同配送（无人机+骑手）场景下的骑手速度（km/h）。"""
+
+        return max(1e-9, float(self.config.rider_speed_cooperative_kmh))
 
     def _build_merchant_customer_distance_cache(self) -> List[float]:
         distance_cache: List[float] = []
@@ -3083,7 +3089,8 @@ class DroneRiderFusionOptimizer:
         dist_ij = self._distance_2d(
             order_i.customer_x, order_i.customer_y, order_j.customer_x, order_j.customer_y
         )
-        t_ij = self._hours_from_distance(dist_ij, self.calculator.rider_speed) + order_i.service_time
+        rider_speed = self._cooperative_rider_speed()
+        t_ij = self._hours_from_distance(dist_ij, rider_speed) + order_i.service_time
 
         lt_i = float(order_i.earliest_time)
         ut_i = float(order_i.latest_time)
@@ -3113,7 +3120,7 @@ class DroneRiderFusionOptimizer:
             order_i.customer_x, order_i.customer_y, order_j.customer_x, order_j.customer_y
         )
         d_t_h = self._temporal_distance_component(order_i, order_j)
-        d_t_equiv = d_t_h * self.calculator.rider_speed * 1000.0
+        d_t_equiv = d_t_h * self._cooperative_rider_speed() * 1000.0
         alpha = float(np.clip(self.config.alpha_spatial, 0.0, 1.0))
         return float(alpha * d_ij + (1.0 - alpha) * d_t_equiv)
 
@@ -3139,7 +3146,7 @@ class DroneRiderFusionOptimizer:
             delivery_m = self._distance_2d(pickup_x, pickup_y, current_order.customer_x, current_order.customer_y)
             spatial_m = reposition_m + delivery_m
             temporal_h = self._temporal_distance_component(prev_order, current_order)
-            temporal_equiv_m = temporal_h * self.calculator.rider_speed * 1000.0
+            temporal_equiv_m = temporal_h * self._cooperative_rider_speed() * 1000.0
 
         alpha = float(np.clip(self.config.alpha_spatial, 0.0, 1.0))
         return float(alpha * spatial_m + (1.0 - alpha) * temporal_equiv_m)
@@ -3164,6 +3171,7 @@ class DroneRiderFusionOptimizer:
             sorted_orders = sorted(range(n_orders), key=lambda oi: arrival_time[oi])
         else:
             sorted_orders = self._normalize_order_sequence(order_sequence)
+        rider_speed = self._cooperative_rider_speed()
         for oi in sorted_orders:
             order = self.orders[oi]
             g = assigned_candidate[oi]
@@ -3180,11 +3188,11 @@ class DroneRiderFusionOptimizer:
 
                 pos = rider_pos[r]
                 to_pickup_m = 0.0 if pos is None else self._distance_2d(pos[0], pos[1], pickup_x, pickup_y)
-                to_pickup_h = self._hours_from_distance(to_pickup_m, self.calculator.rider_speed)
+                to_pickup_h = self._hours_from_distance(to_pickup_m, rider_speed)
                 depart = max(rider_available[r] + to_pickup_h, arrival_time[oi], order.earliest_time)
 
                 leg_m = self._distance_2d(pickup_x, pickup_y, order.customer_x, order.customer_y)
-                leg_h = self._hours_from_distance(leg_m, self.calculator.rider_speed)
+                leg_h = self._hours_from_distance(leg_m, rider_speed)
                 finish = depart + leg_h + order.service_time
 
                 if finish < best_finish:
@@ -3202,10 +3210,10 @@ class DroneRiderFusionOptimizer:
                 best_r = int(np.argmin(rider_available))
                 pos = rider_pos[best_r]
                 to_pickup_m = 0.0 if pos is None else self._distance_2d(pos[0], pos[1], pickup_x, pickup_y)
-                to_pickup_h = self._hours_from_distance(to_pickup_m, self.calculator.rider_speed)
+                to_pickup_h = self._hours_from_distance(to_pickup_m, rider_speed)
                 best_depart = max(rider_available[best_r] + to_pickup_h, arrival_time[oi], order.earliest_time)
                 leg_m = self._distance_2d(pickup_x, pickup_y, order.customer_x, order.customer_y)
-                leg_h = self._hours_from_distance(leg_m, self.calculator.rider_speed)
+                leg_h = self._hours_from_distance(leg_m, rider_speed)
                 best_finish = best_depart + leg_h + order.service_time
 
             assigned_rider[oi] = best_r
@@ -4406,6 +4414,7 @@ def solve_fused_delivery_model(
             output_dir=tabular_dir,
             rider_count_for_rider_only=optimizer.n_riders,
             rider_capacity_for_rider_only=optimizer.config.rider_capacity,
+            rider_speed_for_rider_only_kmh=optimizer.config.rider_speed_rider_only_kmh,
             safe_clearance_height=optimizer.config.safe_clearance_height,
             min_flight_height=optimizer.config.min_flight_height,
             max_flight_height=optimizer.config.max_flight_height,

@@ -8,6 +8,7 @@
 """
 
 import csv
+import heapq
 from collections import defaultdict
 from dataclasses import dataclass
 from math import atan2, pi, sqrt
@@ -314,6 +315,17 @@ class UAVPathCostCalculator:
         start: Tuple[float, float, float],
         end: Tuple[float, float, float],
     ) -> float:
+        """计算障碍物相关代价（碰撞惩罚 + 高度奖励）。"""
+
+        total_B, _ = self.obstacle_collision_detail(path, start, end)
+        return float(total_B)
+
+    def obstacle_collision_detail(
+        self,
+        path: List[Tuple[float, float, float]],
+        start: Tuple[float, float, float],
+        end: Tuple[float, float, float],
+    ) -> Tuple[float, int]:
         """计算障碍物相关代价（碰撞惩罚 + 高度奖励）。
 
         参数:
@@ -322,7 +334,7 @@ class UAVPathCostCalculator:
             end: 终点 (x, y, H)
 
         返回:
-            障碍物总代价。
+            (障碍物总代价, 有效避障次数)。
 
         说明:
             - 对每个航段，仅检查最近 k 个障碍物。
@@ -368,12 +380,14 @@ class UAVPathCostCalculator:
             ignored_collision_indices.add(collision_indices[-1])
 
         total_B = 0.0
+        collision_count = 0
         for idx, collide in enumerate(collision_flags):
             if collide and idx not in ignored_collision_indices:
                 total_B += self.c_B
+                collision_count += 1
             total_B += height_rewards[idx]
 
-        return float(total_B)
+        return float(total_B), int(collision_count)
 
     def flight_distance_cost(
         self,
@@ -995,6 +1009,10 @@ def main() -> None:
                 print("Rendered performance plots:")
                 for name, path in solution.performance_plot_paths.items():
                     print(f"  - {name}: {path}")
+            if solution.csv_output_paths:
+                print("Exported CSV reports:")
+                for name, path in solution.csv_output_paths.items():
+                    print(f"  - {name}: {path}")
                  
     else:
         print("Default real-data files are incomplete; fallback to demo data.")
@@ -1230,6 +1248,12 @@ class FusionModelConfig:
     ga_random_seed: Optional[int] = 42
     ga_force_mutation_if_none: bool = True
     ga_verbose: bool = False
+    enable_multi_waypoint_search: bool = True
+    path_grid_step_m: float = 120.0
+    path_search_margin_m: float = 300.0
+    path_obstacle_buffer_m: float = 20.0
+    path_max_expand_nodes: int = 4000
+    path_max_waypoints: int = 8
 
 
 @dataclass
@@ -1249,6 +1273,7 @@ class FusedModelSolution:
     performance_report: Optional[Dict[str, Any]] = None
     rendered_plan_paths: Optional[Dict[str, str]] = None
     performance_plot_paths: Optional[Dict[str, str]] = None
+    csv_output_paths: Optional[Dict[str, str]] = None
 
 
 @dataclass
@@ -1325,6 +1350,7 @@ def _building_color_by_height(height: float) -> Tuple[float, float, float]:
 
 def _extract_solution_routes(
     terrain: Terrain,
+    obstacles: List[Obstacle],
     merchants: List[Dict[str, Any]],
     customers: List[Dict[str, Any]],
     candidate_points: List[Tuple[float, float]],
@@ -1333,6 +1359,12 @@ def _extract_solution_routes(
     min_flight_height: float,
     max_flight_height: float,
     rider_ground_lift: float,
+    enable_multi_waypoint_search: bool = True,
+    path_grid_step_m: float = 120.0,
+    path_search_margin_m: float = 300.0,
+    path_obstacle_buffer_m: float = 20.0,
+    path_max_expand_nodes: int = 4000,
+    path_max_waypoints: int = 8,
 ) -> List[Dict[str, Any]]:
     """将最终规划结果转换为可绘制的无人机/骑手路径。"""
 
@@ -1341,6 +1373,12 @@ def _extract_solution_routes(
         return routes
 
     lift = max(0.5, float(rider_ground_lift))
+    search_calculator = UAVPathCostCalculator(
+        terrain=terrain,
+        obstacles=obstacles,
+    )
+    # 渲染阶段按订单遍历时，同一商家->候选点航段可能重复出现，这里做缓存避免重复搜索。
+    uav_path_cache: Dict[Tuple[int, int], List[Tuple[float, float, float]]] = {}
     for plan in solution.order_plan:
         merchant_idx = int(plan.get("merchant_idx", -1))
         customer_idx = int(plan.get("customer_idx", -1))
@@ -1371,11 +1409,29 @@ def _extract_solution_routes(
         gz = terrain.get_elevation(gx, gy)
         cz = terrain.get_elevation(cx, cy)
 
-        cruise = max(mz, gz) + float(safe_clearance_height)
-        cruise = float(np.clip(cruise, float(min_flight_height), float(max_flight_height)))
+        cache_key = (merchant_idx, candidate_idx)
+        uav_path = uav_path_cache.get(cache_key)
+        if uav_path is None:
+            cruise = max(mz, gz) + float(safe_clearance_height)
+            cruise = float(np.clip(cruise, float(min_flight_height), float(max_flight_height)))
 
-        mid = ((mx + gx) * 0.5, (my + gy) * 0.5, cruise)
-        uav_path = [(mx, my, mz), mid, (gx, gy, cruise)]
+            start = (mx, my, mz)
+            end = (gx, gy, cruise)
+            inner_points = _search_uav_path_points(
+                calculator=search_calculator,
+                start=start,
+                end=end,
+                cruise=cruise,
+                enable_multi_waypoint_search=bool(enable_multi_waypoint_search),
+                grid_step_m=float(path_grid_step_m),
+                search_margin_m=float(path_search_margin_m),
+                obstacle_buffer_m=float(path_obstacle_buffer_m),
+                max_expand_nodes=int(path_max_expand_nodes),
+                max_waypoints=int(path_max_waypoints),
+            )
+            uav_path = [start] + inner_points + [end]
+            uav_path_cache[cache_key] = uav_path
+
         rider_path = [(gx, gy, gz + lift), (cx, cy, cz + lift)]
 
         routes.append(
@@ -1404,6 +1460,12 @@ def render_fused_solution_map(
     min_flight_height: float = 20.0,
     max_flight_height: float = 120.0,
     rider_ground_lift: float = 2.0,
+    enable_multi_waypoint_search: bool = True,
+    path_grid_step_m: float = 120.0,
+    path_search_margin_m: float = 300.0,
+    path_obstacle_buffer_m: float = 20.0,
+    path_max_expand_nodes: int = 4000,
+    path_max_waypoints: int = 8,
     show_uav_paths: bool = True,
     show_rider_paths: bool = True,
     title: str = "Fused Delivery Plan",
@@ -1480,6 +1542,7 @@ def render_fused_solution_map(
 
     routes = _extract_solution_routes(
         terrain=terrain,
+        obstacles=obstacles,
         merchants=merchants,
         customers=customers,
         candidate_points=candidate_points,
@@ -1488,6 +1551,12 @@ def render_fused_solution_map(
         min_flight_height=min_flight_height,
         max_flight_height=max_flight_height,
         rider_ground_lift=rider_ground_lift,
+        enable_multi_waypoint_search=enable_multi_waypoint_search,
+        path_grid_step_m=path_grid_step_m,
+        path_search_margin_m=path_search_margin_m,
+        path_obstacle_buffer_m=path_obstacle_buffer_m,
+        path_max_expand_nodes=path_max_expand_nodes,
+        path_max_waypoints=path_max_waypoints,
     )
 
     drone_palette = [
@@ -1904,6 +1973,559 @@ def render_fused_performance_plots(
     return saved_paths
 
 
+def _resolve_tabular_output_dir(
+    csv_output_dir: Optional[str],
+    render_save_path: Optional[str],
+    performance_save_dir: Optional[str],
+) -> Path:
+    """解析表格输出目录。"""
+
+    if csv_output_dir:
+        out_dir = Path(csv_output_dir).expanduser().resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return out_dir
+
+    if performance_save_dir:
+        out_dir = Path(performance_save_dir).expanduser().resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return out_dir
+
+    if render_save_path:
+        target = Path(render_save_path).expanduser()
+        out_dir = target.resolve().parent if target.suffix else target.resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return out_dir
+
+    out_dir = (Path.cwd() / "统一输出").resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir
+
+
+def _entity_display_name(entity: Dict[str, Any], idx: int, prefix: str) -> str:
+    """生成实体显示名，优先 name/id。"""
+
+    name = str(entity.get("name", "")).strip()
+    if name:
+        return name
+    eid = str(entity.get("id", "")).strip()
+    if eid:
+        return eid
+    return f"{prefix}{idx}"
+
+
+def _segment_intersects_any_obstacle(
+    p1_xy: Tuple[float, float],
+    p2_xy: Tuple[float, float],
+    obstacles_xy: List[Tuple[float, float, float]],
+) -> bool:
+    """判断二维线段是否与任一障碍物（含缓冲半径）相交。"""
+
+    x1, y1 = float(p1_xy[0]), float(p1_xy[1])
+    x2, y2 = float(p2_xy[0]), float(p2_xy[1])
+    min_x, max_x = (x1, x2) if x1 <= x2 else (x2, x1)
+    min_y, max_y = (y1, y2) if y1 <= y2 else (y2, y1)
+
+    for ox, oy, rr in obstacles_xy:
+        if ox < min_x - rr or ox > max_x + rr or oy < min_y - rr or oy > max_y + rr:
+            continue
+        if UAVPathCostCalculator._segment_intersect_cylinder(
+            (x1, y1, 0.0),
+            (x2, y2, 0.0),
+            float(ox),
+            float(oy),
+            float(rr),
+        ):
+            return True
+    return False
+
+
+def _nearest_free_grid_index(
+    valid_mask: np.ndarray,
+    xs: np.ndarray,
+    ys: np.ndarray,
+    px: float,
+    py: float,
+) -> Optional[Tuple[int, int]]:
+    """返回距离给定点最近的可行网格索引。"""
+
+    h, w = valid_mask.shape
+    best: Optional[Tuple[int, int]] = None
+    best_d2 = float("inf")
+    for iy in range(h):
+        yv = float(ys[iy])
+        for ix in range(w):
+            if not bool(valid_mask[iy, ix]):
+                continue
+            xv = float(xs[ix])
+            d2 = (xv - px) ** 2 + (yv - py) ** 2
+            if d2 < best_d2:
+                best_d2 = d2
+                best = (ix, iy)
+    return best
+
+
+def _visibility_simplify_polyline(
+    points_xy: List[Tuple[float, float]],
+    obstacles_xy: List[Tuple[float, float, float]],
+) -> List[Tuple[float, float]]:
+    """按可视性裁剪折线，减少不必要拐点。"""
+
+    if len(points_xy) <= 2:
+        return points_xy
+
+    simplified: List[Tuple[float, float]] = [points_xy[0]]
+    i = 0
+    n = len(points_xy)
+    while i < n - 1:
+        next_idx = i + 1
+        for j in range(n - 1, i, -1):
+            if not _segment_intersects_any_obstacle(points_xy[i], points_xy[j], obstacles_xy):
+                next_idx = j
+                break
+        simplified.append(points_xy[next_idx])
+        i = next_idx
+    return simplified
+
+
+def _search_uav_path_points(
+    calculator: UAVPathCostCalculator,
+    start: Tuple[float, float, float],
+    end: Tuple[float, float, float],
+    cruise: float,
+    enable_multi_waypoint_search: bool,
+    grid_step_m: float,
+    search_margin_m: float,
+    obstacle_buffer_m: float,
+    max_expand_nodes: int,
+    max_waypoints: int,
+) -> List[Tuple[float, float, float]]:
+    """从起点到终点搜索多拐点路径；失败时回退为单中点。"""
+
+    sx, sy, _ = start
+    gx, gy, _ = end
+    mid_fallback = ((sx + gx) * 0.5, (sy + gy) * 0.5, float(cruise))
+
+    if not enable_multi_waypoint_search or not calculator.obstacles:
+        return [mid_fallback]
+
+    step = max(20.0, float(grid_step_m))
+    buffer_m = max(0.0, float(obstacle_buffer_m))
+    max_nodes = max(200, int(max_expand_nodes))
+    max_wp = max(1, int(max_waypoints))
+
+    terrain = calculator.terrain
+    direct_dist = sqrt((gx - sx) ** 2 + (gy - sy) ** 2)
+    margin = max(float(search_margin_m), step * 2.0, direct_dist * 0.25)
+
+    min_x = max(float(terrain.x_min), min(sx, gx) - margin)
+    max_x = min(float(terrain.x_max), max(sx, gx) + margin)
+    min_y = max(float(terrain.y_min), min(sy, gy) - margin)
+    max_y = min(float(terrain.y_max), max(sy, gy) + margin)
+
+    if max_x - min_x < step or max_y - min_y < step:
+        return [mid_fallback]
+
+    xs = np.arange(min_x, max_x + 0.5 * step, step, dtype=float)
+    ys = np.arange(min_y, max_y + 0.5 * step, step, dtype=float)
+    if xs.size < 2 or ys.size < 2:
+        return [mid_fallback]
+
+    obstacles_xy: List[Tuple[float, float, float]] = []
+    for obs in calculator.obstacles:
+        rr = float(obs.r) + buffer_m
+        ox = float(obs.x)
+        oy = float(obs.y)
+        if ox + rr < min_x or ox - rr > max_x or oy + rr < min_y or oy - rr > max_y:
+            continue
+        obstacles_xy.append((ox, oy, rr))
+
+    if not obstacles_xy:
+        return [mid_fallback]
+
+    if not _segment_intersects_any_obstacle((sx, sy), (gx, gy), obstacles_xy):
+        return [mid_fallback]
+
+    valid = np.ones((ys.size, xs.size), dtype=bool)
+    for iy in range(ys.size):
+        yv = float(ys[iy])
+        for ix in range(xs.size):
+            xv = float(xs[ix])
+            for ox, oy, rr in obstacles_xy:
+                if (xv - ox) ** 2 + (yv - oy) ** 2 <= rr ** 2:
+                    valid[iy, ix] = False
+                    break
+
+    start_idx = _nearest_free_grid_index(valid, xs, ys, float(sx), float(sy))
+    goal_idx = _nearest_free_grid_index(valid, xs, ys, float(gx), float(gy))
+    if start_idx is None or goal_idx is None:
+        return [mid_fallback]
+
+    if start_idx == goal_idx:
+        return [mid_fallback]
+
+    moves = [
+        (-1, -1),
+        (0, -1),
+        (1, -1),
+        (-1, 0),
+        (1, 0),
+        (-1, 1),
+        (0, 1),
+        (1, 1),
+    ]
+
+    edge_block_cache: Dict[Tuple[Tuple[int, int], Tuple[int, int]], bool] = {}
+    g_score: Dict[Tuple[int, int], float] = {start_idx: 0.0}
+    came_from: Dict[Tuple[int, int], Tuple[int, int]] = {}
+
+    def _heuristic(a: Tuple[int, int], b: Tuple[int, int]) -> float:
+        ax, ay = float(xs[a[0]]), float(ys[a[1]])
+        bx, by = float(xs[b[0]]), float(ys[b[1]])
+        return float(sqrt((ax - bx) ** 2 + (ay - by) ** 2))
+
+    open_heap: List[Tuple[float, float, Tuple[int, int]]] = []
+    heapq.heappush(open_heap, (_heuristic(start_idx, goal_idx), 0.0, start_idx))
+    closed: set = set()
+    expanded = 0
+
+    while open_heap and expanded < max_nodes:
+        _, curr_g, curr = heapq.heappop(open_heap)
+        if curr in closed:
+            continue
+        if curr == goal_idx:
+            break
+        closed.add(curr)
+        expanded += 1
+
+        cx, cy = curr
+        for dx, dy in moves:
+            nx = cx + dx
+            ny = cy + dy
+            if nx < 0 or nx >= xs.size or ny < 0 or ny >= ys.size:
+                continue
+            if not bool(valid[ny, nx]):
+                continue
+
+            nxt = (nx, ny)
+            edge_key = (curr, nxt) if curr <= nxt else (nxt, curr)
+            blocked = edge_block_cache.get(edge_key)
+            if blocked is None:
+                p1 = (float(xs[cx]), float(ys[cy]))
+                p2 = (float(xs[nx]), float(ys[ny]))
+                blocked = _segment_intersects_any_obstacle(p1, p2, obstacles_xy)
+                edge_block_cache[edge_key] = blocked
+            if blocked:
+                continue
+
+            step_cost = sqrt((float(xs[nx]) - float(xs[cx])) ** 2 + (float(ys[ny]) - float(ys[cy])) ** 2)
+            tentative_g = float(curr_g + step_cost)
+            prev_best = g_score.get(nxt, float("inf"))
+            if tentative_g + 1e-9 >= prev_best:
+                continue
+
+            came_from[nxt] = curr
+            g_score[nxt] = tentative_g
+            f_score = tentative_g + _heuristic(nxt, goal_idx)
+            heapq.heappush(open_heap, (f_score, tentative_g, nxt))
+
+    if goal_idx not in came_from:
+        return [mid_fallback]
+
+    path_idx: List[Tuple[int, int]] = [goal_idx]
+    cur = goal_idx
+    while cur != start_idx:
+        cur = came_from.get(cur)
+        if cur is None:
+            return [mid_fallback]
+        path_idx.append(cur)
+    path_idx.reverse()
+
+    grid_points_xy = [(float(xs[ix]), float(ys[iy])) for ix, iy in path_idx]
+    polyline_xy = [(float(sx), float(sy))] + grid_points_xy + [(float(gx), float(gy))]
+    simplified_xy = _visibility_simplify_polyline(polyline_xy, obstacles_xy)
+    inner_xy = simplified_xy[1:-1]
+
+    if not inner_xy:
+        return [mid_fallback]
+
+    if len(inner_xy) > max_wp:
+        select_idx = np.linspace(0, len(inner_xy) - 1, max_wp, dtype=int)
+        inner_xy = [inner_xy[int(i)] for i in select_idx.tolist()]
+
+    return [(float(x), float(y), float(cruise)) for x, y in inner_xy]
+
+
+def _build_uav_leg_report(
+    calculator: UAVPathCostCalculator,
+    merchant: Dict[str, Any],
+    candidate_point: Tuple[float, float],
+    safe_clearance_height: float,
+    min_flight_height: float,
+    max_flight_height: float,
+    enable_multi_waypoint_search: bool = True,
+    path_grid_step_m: float = 120.0,
+    path_search_margin_m: float = 300.0,
+    path_obstacle_buffer_m: float = 20.0,
+    path_max_expand_nodes: int = 4000,
+    path_max_waypoints: int = 8,
+    drone_cruise_power_w: float = 420.0,
+    drone_battery_energy_wh: float = 588.0,
+) -> Dict[str, float]:
+    """构建单条商家->候选点航段的明细指标。"""
+
+    mx = float(merchant.get("x", 0.0))
+    my = float(merchant.get("y", 0.0))
+    gx = float(candidate_point[0])
+    gy = float(candidate_point[1])
+
+    terrain = calculator.terrain
+    mz = terrain.get_elevation(mx, my)
+    gz = terrain.get_elevation(gx, gy)
+    cruise = max(mz, gz) + float(safe_clearance_height)
+    cruise = float(np.clip(cruise, float(min_flight_height), float(max_flight_height)))
+
+    start = (mx, my, mz)
+    end = (gx, gy, cruise)
+    path = _search_uav_path_points(
+        calculator=calculator,
+        start=start,
+        end=end,
+        cruise=cruise,
+        enable_multi_waypoint_search=bool(enable_multi_waypoint_search),
+        grid_step_m=float(path_grid_step_m),
+        search_margin_m=float(path_search_margin_m),
+        obstacle_buffer_m=float(path_obstacle_buffer_m),
+        max_expand_nodes=int(path_max_expand_nodes),
+        max_waypoints=int(path_max_waypoints),
+    )
+
+    terrain_cost_value = float(calculator.terrain_cost(path))
+    obstacle_cost_value, collision_count = calculator.obstacle_collision_detail(path, start, end)
+    flight_distance_m = float(calculator.flight_distance_cost(path, start, end))
+    altitude_penalty = float(calculator.altitude_variation_cost(path, start, end))
+    turning_penalty = float(calculator.turning_angle_cost(path, start, end))
+    total_cost = float(
+        terrain_cost_value
+        + obstacle_cost_value
+        + flight_distance_m
+        + altitude_penalty
+        + turning_penalty
+    )
+
+    straight_distance_m = float(sqrt((gx - mx) ** 2 + (gy - my) ** 2))
+    speed_km_h = max(float(calculator.drone_speed), 1e-9)
+    flight_time_h = float((flight_distance_m / 1000.0) / speed_km_h)
+    flight_time_min = float(flight_time_h * 60.0)
+
+    battery_wh = max(float(drone_battery_energy_wh), 1e-9)
+    energy_percent = float((float(drone_cruise_power_w) * flight_time_h / battery_wh) * 100.0)
+
+    return {
+        "straight_distance_m": straight_distance_m,
+        "actual_distance_m": flight_distance_m,
+        "flight_time_min": flight_time_min,
+        "energy_percent": energy_percent,
+        "collision_count": int(collision_count),
+        "path_cost": total_cost,
+        "altitude_penalty": altitude_penalty,
+        "turning_penalty": turning_penalty,
+    }
+
+
+def _write_csv_rows(
+    file_path: Path,
+    fieldnames: List[str],
+    rows: List[Dict[str, Any]],
+) -> None:
+    """按 UTF-8-SIG 写入 CSV。"""
+
+    with file_path.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def export_fused_solution_csv_reports(
+    calculator: UAVPathCostCalculator,
+    merchants: List[Dict[str, Any]],
+    customers: List[Dict[str, Any]],
+    candidate_points: List[Tuple[float, float]],
+    orders: List[DeliveryOrder],
+    solution: FusedModelSolution,
+    output_dir: Path,
+    safe_clearance_height: float = 20.0,
+    min_flight_height: float = 20.0,
+    max_flight_height: float = 120.0,
+    enable_multi_waypoint_search: bool = True,
+    path_grid_step_m: float = 120.0,
+    path_search_margin_m: float = 300.0,
+    path_obstacle_buffer_m: float = 20.0,
+    path_max_expand_nodes: int = 4000,
+    path_max_waypoints: int = 8,
+) -> Dict[str, str]:
+    """导出融合模型的三类 CSV 报表。"""
+
+    output_dir = output_dir.expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    selected_candidates: List[int] = []
+    seen_candidates = set()
+    for g in solution.selected_candidates:
+        gi = int(g)
+        if 0 <= gi < len(candidate_points) and gi not in seen_candidates:
+            seen_candidates.add(gi)
+            selected_candidates.append(gi)
+
+    selected_rows: List[Dict[str, Any]] = []
+    for idx, gi in enumerate(selected_candidates, start=1):
+        gx, gy = candidate_points[gi]
+        gz = calculator.terrain.get_elevation(gx, gy)
+        selected_rows.append(
+            {
+                "编号": int(idx),
+                "候选点索引": int(gi),
+                "X": round(float(gx), 6),
+                "Y": round(float(gy), 6),
+                "Z": round(float(gz), 6),
+            }
+        )
+
+    selected_path = output_dir / "最终所选起降点列表.csv"
+    _write_csv_rows(
+        selected_path,
+        fieldnames=["编号", "候选点索引", "X", "Y", "Z"],
+        rows=selected_rows,
+    )
+
+    leg_cache: Dict[Tuple[int, int], Dict[str, float]] = {}
+
+    def _cached_leg(mi: int, gi: int) -> Dict[str, float]:
+        key = (int(mi), int(gi))
+        if key not in leg_cache:
+            leg_cache[key] = _build_uav_leg_report(
+                calculator=calculator,
+                merchant=merchants[mi],
+                candidate_point=candidate_points[gi],
+                safe_clearance_height=safe_clearance_height,
+                min_flight_height=min_flight_height,
+                max_flight_height=max_flight_height,
+                enable_multi_waypoint_search=enable_multi_waypoint_search,
+                path_grid_step_m=path_grid_step_m,
+                path_search_margin_m=path_search_margin_m,
+                path_obstacle_buffer_m=path_obstacle_buffer_m,
+                path_max_expand_nodes=path_max_expand_nodes,
+                path_max_waypoints=path_max_waypoints,
+            )
+        return leg_cache[key]
+
+    route_rows: List[Dict[str, Any]] = []
+    for mi, merchant in enumerate(merchants):
+        start_name = _entity_display_name(merchant, mi, "M")
+        for gi in selected_candidates:
+            leg = _cached_leg(mi, gi)
+            route_rows.append(
+                {
+                    "起点": start_name,
+                    "终点": f"G{gi}",
+                    "直线距离_m": round(float(leg["straight_distance_m"]), 4),
+                    "实际距离_m": round(float(leg["actual_distance_m"]), 4),
+                    "飞行时间_分钟": round(float(leg["flight_time_min"]), 4),
+                    "耗电量_百分比": round(float(leg["energy_percent"]), 4),
+                    "避障次数": int(leg["collision_count"]),
+                    "路径代价": round(float(leg["path_cost"]), 4),
+                    "高度惩罚": round(float(leg["altitude_penalty"]), 4),
+                    "转向惩罚": round(float(leg["turning_penalty"]), 4),
+                }
+            )
+
+    route_path = output_dir / "商家到所选起降点无人机运输路线结果.csv"
+    _write_csv_rows(
+        route_path,
+        fieldnames=[
+            "起点",
+            "终点",
+            "直线距离_m",
+            "实际距离_m",
+            "飞行时间_分钟",
+            "耗电量_百分比",
+            "避障次数",
+            "路径代价",
+            "高度惩罚",
+            "转向惩罚",
+        ],
+        rows=route_rows,
+    )
+
+    order_rows: List[Dict[str, Any]] = []
+    for plan in solution.order_plan:
+        oi = int(plan.get("order_index", -1))
+        if oi < 0 or oi >= len(orders):
+            continue
+        order = orders[oi]
+        mi = int(plan.get("merchant_idx", order.merchant_idx))
+        ci = int(plan.get("customer_idx", order.customer_idx))
+        gi = int(plan.get("candidate_idx", -1))
+
+        if 0 <= mi < len(merchants):
+            start_name = _entity_display_name(merchants[mi], mi, "M")
+        else:
+            start_name = f"M{mi}"
+
+        if 0 <= ci < len(customers):
+            end_name = _entity_display_name(customers[ci], ci, "C")
+        else:
+            end_name = f"C{ci}"
+
+        launch_h = float(order.earliest_time)
+        arrive_h = float(plan.get("delivery_time_h", launch_h))
+        uav_depart_h = float(plan.get("uav_depart_time_h", launch_h))
+        uav_arrive_h = float(plan.get("uav_arrival_time_h", uav_depart_h))
+
+        total_delivery_h = max(0.0, arrive_h - launch_h)
+        uav_delivery_h = max(0.0, uav_arrive_h - uav_depart_h)
+        rider_delivery_h = max(0.0, arrive_h - uav_arrive_h)
+
+        total_energy = 0.0
+        if 0 <= mi < len(merchants) and 0 <= gi < len(candidate_points):
+            total_energy = float(_cached_leg(mi, gi)["energy_percent"])
+
+        order_rows.append(
+            {
+                "起点": start_name,
+                "终点": end_name,
+                "订单发起时间": round(launch_h * 60.0, 4),
+                "到达时间": round(arrive_h * 60.0, 4),
+                "总配送时间": round(total_delivery_h * 60.0, 4),
+                "无人机配送时间": round(uav_delivery_h * 60.0, 4),
+                "骑手配送时间": round(rider_delivery_h * 60.0, 4),
+                "总能耗": round(total_energy, 4),
+            }
+        )
+
+    order_path = output_dir / "模拟订单详细配送数据.csv"
+    _write_csv_rows(
+        order_path,
+        fieldnames=[
+            "起点",
+            "终点",
+            "订单发起时间",
+            "到达时间",
+            "总配送时间",
+            "无人机配送时间",
+            "骑手配送时间",
+            "总能耗",
+        ],
+        rows=order_rows,
+    )
+
+    return {
+        "selected_candidates": str(selected_path),
+        "merchant_to_candidate_routes": str(route_path),
+        "simulated_orders": str(order_path),
+    }
+
+
 class InfeasibleFusionPlanError(RuntimeError):
     """融合模型不可行时抛出的异常。"""
 
@@ -2070,8 +2692,18 @@ class DroneRiderFusionOptimizer:
 
         start = (mx, my, mz)
         end = (gx, gy, cruise)
-        mid = ((mx + gx) * 0.5, (my + gy) * 0.5, cruise)
-        path = [mid]
+        path = _search_uav_path_points(
+            calculator=self.calculator,
+            start=start,
+            end=end,
+            cruise=cruise,
+            enable_multi_waypoint_search=bool(self.config.enable_multi_waypoint_search),
+            grid_step_m=float(self.config.path_grid_step_m),
+            search_margin_m=float(self.config.path_search_margin_m),
+            obstacle_buffer_m=float(self.config.path_obstacle_buffer_m),
+            max_expand_nodes=int(self.config.path_max_expand_nodes),
+            max_waypoints=int(self.config.path_max_waypoints),
+        )
 
         tc = self.calculator.terrain_cost(path)
         oc = self.calculator.obstacle_collision_cost(path, start, end)
@@ -3435,6 +4067,8 @@ def solve_fused_delivery_model(
     performance_save_dir: Optional[str] = None,
     performance_show: bool = False,
     performance_file_prefix: str = "fusion_model",
+    export_csv: bool = True,
+    csv_output_dir: Optional[str] = None,
 ) -> FusedModelSolution:
     """融合模型的便捷入口函数。
 
@@ -3453,6 +4087,9 @@ def solve_fused_delivery_model(
         performance_save_dir: 性能图输出目录，默认 `./统一输出`
         performance_show: 是否弹出性能图窗口
         performance_file_prefix: 性能图文件名前缀
+        export_csv: 是否导出三类 CSV 报表
+        csv_output_dir: CSV 输出目录；为空时自动回退到 `performance_save_dir`、
+            `render_save_path` 所在目录或 `./统一输出`
     """
 
     orders = build_orders_from_customers(
@@ -3503,6 +4140,12 @@ def solve_fused_delivery_model(
                 safe_clearance_height=optimizer.config.safe_clearance_height,
                 min_flight_height=optimizer.config.min_flight_height,
                 max_flight_height=optimizer.config.max_flight_height,
+                enable_multi_waypoint_search=optimizer.config.enable_multi_waypoint_search,
+                path_grid_step_m=optimizer.config.path_grid_step_m,
+                path_search_margin_m=optimizer.config.path_search_margin_m,
+                path_obstacle_buffer_m=optimizer.config.path_obstacle_buffer_m,
+                path_max_expand_nodes=optimizer.config.path_max_expand_nodes,
+                path_max_waypoints=optimizer.config.path_max_waypoints,
                 show_uav_paths=show_uav,
                 show_rider_paths=show_rider,
                 title=title,
@@ -3525,6 +4168,36 @@ def solve_fused_delivery_model(
         print(f"[Post] Done performance plots, elapsed={time.perf_counter() - t_perf:.1f}s")
         if performance_paths:
             solution.performance_plot_paths = performance_paths
+
+    if export_csv:
+        t_csv = time.perf_counter()
+        print("[Post] Exporting CSV reports ...")
+        tabular_dir = _resolve_tabular_output_dir(
+            csv_output_dir=csv_output_dir,
+            render_save_path=render_save_path,
+            performance_save_dir=performance_save_dir,
+        )
+        csv_paths = export_fused_solution_csv_reports(
+            calculator=calculator,
+            merchants=merchants,
+            customers=customers,
+            candidate_points=candidate_points,
+            orders=orders,
+            solution=solution,
+            output_dir=tabular_dir,
+            safe_clearance_height=optimizer.config.safe_clearance_height,
+            min_flight_height=optimizer.config.min_flight_height,
+            max_flight_height=optimizer.config.max_flight_height,
+            enable_multi_waypoint_search=optimizer.config.enable_multi_waypoint_search,
+            path_grid_step_m=optimizer.config.path_grid_step_m,
+            path_search_margin_m=optimizer.config.path_search_margin_m,
+            path_obstacle_buffer_m=optimizer.config.path_obstacle_buffer_m,
+            path_max_expand_nodes=optimizer.config.path_max_expand_nodes,
+            path_max_waypoints=optimizer.config.path_max_waypoints,
+        )
+        print(f"[Post] Done CSV reports, elapsed={time.perf_counter() - t_csv:.1f}s")
+        if csv_paths:
+            solution.csv_output_paths = csv_paths
 
     return solution
 

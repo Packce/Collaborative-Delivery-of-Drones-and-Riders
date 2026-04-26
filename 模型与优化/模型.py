@@ -4111,7 +4111,10 @@ def solve_fused_delivery_model(
         n_riders=n_riders,
         config=cfg,
     )
+    t_opt = time.perf_counter()
     solution = optimizer.solve()
+    optimize_elapsed = time.perf_counter() - t_opt
+    print(f"[Solve] Optimization finished, elapsed={optimize_elapsed:.1f}s")
     if optimizer.last_performance_report is not None:
         solution.performance_report = dict(optimizer.last_performance_report)
 

@@ -61,6 +61,50 @@ def _point_with_agl(
     return gx, gy, float(ground + float(agl_height))
 
 
+def _normalize_algorithm_name(algorithm_name: Optional[str]) -> str:
+    """将算法名规范化为可用于文件名的标签。"""
+
+    raw = str(algorithm_name or "").strip().lower()
+    if not raw:
+        return "unknown"
+
+    chars: List[str] = []
+    for ch in raw:
+        if ch.isalnum():
+            chars.append(ch)
+        elif ch in {" ", "-", ".", "/", "\\"}:
+            chars.append("_")
+        else:
+            chars.append("_")
+
+    tag = "".join(chars)
+    while "__" in tag:
+        tag = tag.replace("__", "_")
+    tag = tag.strip("_")
+    return tag or "unknown"
+
+
+def _append_algorithm_suffix_to_stem(stem: str, algorithm_name: Optional[str]) -> str:
+    """为文件 stem 追加算法后缀，避免重复追加。"""
+
+    algo_tag = _normalize_algorithm_name(algorithm_name)
+    suffix = f"_{algo_tag}"
+    if stem.lower().endswith(suffix.lower()):
+        return stem
+    return f"{stem}{suffix}"
+
+
+def _append_algorithm_suffix_to_path(path: Path, algorithm_name: Optional[str]) -> Path:
+    """为文件路径追加算法后缀（位于扩展名前）。"""
+
+    if path.suffix:
+        new_stem = _append_algorithm_suffix_to_stem(path.stem, algorithm_name)
+        new_name = f"{new_stem}{path.suffix}"
+    else:
+        new_name = _append_algorithm_suffix_to_stem(path.name, algorithm_name)
+    return path.with_name(new_name)
+
+
 @dataclass
 class Obstacle:
     """圆柱体障碍物模型（建筑物简化）。
@@ -971,9 +1015,10 @@ def main() -> None:
     project_root = Path(__file__).resolve().parents[1]
     merchant_csv = project_root / "数据" / "商家数据.csv"
     customer_csv = project_root / "数据" / "顾客数据.csv"
-    NSGA_OPTION = False #改进的遗传算法NSGA-II使用开关
+    NSGA_OPTION = False #改进的NSGA-II算法使用开关
     CLASSIC_GA_OPTION = False #经典遗传算法使用开关
     CLASSIC_NSGA_OPTION = True #传统NSGA算法使用开关
+    PSO_OPTION = False #粒子群算法使用开关
 
     if (
         terrain_csv.exists()
@@ -1007,7 +1052,7 @@ def main() -> None:
         print(f"Y range: [{terrain.y_min:.3f}, {terrain.y_max:.3f}]")
 
         if NSGA_OPTION:
-            # NSGA-II：改进的遗传算法
+            # 改进NSGA-II：改进的NSGA-II遗传算法
             print("Starting NSGA-II optimization...")
             cfg = FusionModelConfig(
                 solver_mode="nsga2",
@@ -1102,7 +1147,7 @@ def main() -> None:
                 performance_show=False,
                 performance_file_prefix="classic_nsga_compare",
             )
-        else:
+        elif PSO_OPTION:
             # 粒子群算法
             print("Starting Particle Swarm Optimization...")
             cfg = FusionModelConfig(
@@ -1970,6 +2015,7 @@ def _normalize_render_plan_modes(
 def _resolve_render_output_paths(
     render_save_path: Optional[str],
     modes: List[str],
+    algorithm_name: Optional[str] = None,
 ) -> Dict[str, Optional[str]]:
     """为每种渲染模式生成输出文件路径。"""
 
@@ -1981,18 +2027,38 @@ def _resolve_render_output_paths(
 
     target = Path(render_save_path).expanduser()
     if len(modes) == 1:
-        return {modes[0]: str(target.resolve())}
+        mode = modes[0]
+        if target.suffix:
+            single = _append_algorithm_suffix_to_path(target.resolve(), algorithm_name)
+            single.parent.mkdir(parents=True, exist_ok=True)
+            return {mode: str(single)}
+
+        out_dir = target.resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        single = (out_dir / f"fusion_plan_{mode}.png").resolve()
+        single = _append_algorithm_suffix_to_path(single, algorithm_name)
+        return {mode: str(single)}
 
     if target.suffix:
         parent = target.parent.resolve()
         stem = target.stem
         ext = target.suffix
         parent.mkdir(parents=True, exist_ok=True)
-        return {mode: str((parent / f"{stem}_{mode}{ext}").resolve()) for mode in modes}
+        result: Dict[str, Optional[str]] = {}
+        for mode in modes:
+            file_path = (parent / f"{stem}_{mode}{ext}").resolve()
+            file_path = _append_algorithm_suffix_to_path(file_path, algorithm_name)
+            result[mode] = str(file_path)
+        return result
 
     out_dir = target.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    return {mode: str((out_dir / f"fusion_plan_{mode}.png").resolve()) for mode in modes}
+    result: Dict[str, Optional[str]] = {}
+    for mode in modes:
+        file_path = (out_dir / f"fusion_plan_{mode}.png").resolve()
+        file_path = _append_algorithm_suffix_to_path(file_path, algorithm_name)
+        result[mode] = str(file_path)
+    return result
 
 
 def _render_mode_to_flags(mode: str) -> Tuple[bool, bool, str]:
@@ -2010,6 +2076,7 @@ def render_fused_performance_plots(
     save_dir: Optional[str] = None,
     show: bool = False,
     file_prefix: str = "fusion_model",
+    algorithm_name: Optional[str] = None,
 ) -> Dict[str, str]:
     """绘制融合模型性能图，便于与其他算法对比。"""
 
@@ -2032,7 +2099,8 @@ def render_fused_performance_plots(
         output_dir = (Path.cwd() / "统一输出").resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
 
-    prefix = str(file_prefix).strip().replace(" ", "_") or "fusion_model"
+    prefix_base = str(file_prefix).strip().replace(" ", "_") or "fusion_model"
+    prefix = _append_algorithm_suffix_to_stem(prefix_base, algorithm_name)
     saved_paths: Dict[str, str] = {}
 
     def _finalize_figure(fig: Any, key: str, filename: str) -> None:
@@ -2549,11 +2617,14 @@ def export_fused_solution_csv_reports(
     path_obstacle_buffer_m: float = 20.0,
     path_max_expand_nodes: int = 4000,
     path_max_waypoints: int = 8,
+    algorithm_name: Optional[str] = None,
 ) -> Dict[str, str]:
     """导出融合模型的三类 CSV 报表。"""
 
     output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    algo_tag = _normalize_algorithm_name(algorithm_name)
 
     import time
     timestamp = time.strftime("_%Y%m%d_%H%M%S")
@@ -2580,7 +2651,7 @@ def export_fused_solution_csv_reports(
             }
         )
 
-    selected_path = output_dir / f"最终所选起降点列表{timestamp}.csv"
+    selected_path = output_dir / f"最终所选起降点列表_{algo_tag}{timestamp}.csv"
     _write_csv_rows(
         selected_path,
         fieldnames=["编号", "候选点索引", "X", "Y", "Z"],
@@ -2628,7 +2699,7 @@ def export_fused_solution_csv_reports(
                 }
             )
 
-    route_path = output_dir / f"商家到所选起降点无人机运输路线结果{timestamp}.csv"
+    route_path = output_dir / f"商家到所选起降点无人机运输路线结果_{algo_tag}{timestamp}.csv"
     _write_csv_rows(
         route_path,
         fieldnames=[
@@ -2775,7 +2846,7 @@ def export_fused_solution_csv_reports(
             }
         )
 
-    order_path = output_dir / f"模拟订单详细配送数据{timestamp}.csv"
+    order_path = output_dir / f"模拟订单详细配送数据_{algo_tag}{timestamp}.csv"
     _write_csv_rows(
         order_path,
         fieldnames=[
@@ -5042,12 +5113,13 @@ def solve_fused_delivery_model(
             路径图输出路径；多图模式下:
             - 若传文件名（含后缀），自动在文件名后追加 "_uav/_rider/_fused"
             - 若传目录（不含后缀），写为 fusion_plan_*.png
+            - 所有输出文件会自动追加 "_算法名" 后缀
         render_show: 是否弹出交互窗口显示路径图
         render_performance: 是否绘制性能对比图
         performance_save_dir: 性能图输出目录，默认 `./统一输出`
         performance_show: 是否弹出性能图窗口
-        performance_file_prefix: 性能图文件名前缀
-        export_csv: 是否导出三类 CSV 报表
+        performance_file_prefix: 性能图文件名前缀（最终会自动追加 "_算法名"）
+        export_csv: 是否导出三类 CSV 报表（文件名自动追加 "_算法名"）
         csv_output_dir: CSV 输出目录；为空时自动回退到 `performance_save_dir`、
             `render_save_path` 所在目录或 `./统一输出`
     """
@@ -5073,6 +5145,7 @@ def solve_fused_delivery_model(
     )
     t_opt = time.perf_counter()
     solution = optimizer.solve()
+    algorithm_name = str(solution.solver_mode or cfg.solver_mode or "unknown")
     optimize_elapsed = time.perf_counter() - t_opt
     print(f"[Solve] Optimization finished, elapsed={optimize_elapsed:.1f}s")
     if optimizer.last_performance_report is not None:
@@ -5084,7 +5157,11 @@ def solve_fused_delivery_model(
 
     if render_modes:
         print(f"[Post] Rendering route maps: modes={render_modes}")
-        save_path_map = _resolve_render_output_paths(render_save_path, render_modes)
+        save_path_map = _resolve_render_output_paths(
+            render_save_path,
+            render_modes,
+            algorithm_name=algorithm_name,
+        )
         rendered_paths: Dict[str, str] = {}
         for mode in render_modes:
             t_render = time.perf_counter()
@@ -5127,6 +5204,7 @@ def solve_fused_delivery_model(
             save_dir=performance_save_dir,
             show=performance_show,
             file_prefix=performance_file_prefix,
+            algorithm_name=algorithm_name,
         )
         print(f"[Post] Done performance plots, elapsed={time.perf_counter() - t_perf:.1f}s")
         if performance_paths:
@@ -5160,6 +5238,7 @@ def solve_fused_delivery_model(
             path_obstacle_buffer_m=optimizer.config.path_obstacle_buffer_m,
             path_max_expand_nodes=optimizer.config.path_max_expand_nodes,
             path_max_waypoints=optimizer.config.path_max_waypoints,
+            algorithm_name=algorithm_name,
         )
         print(f"[Post] Done CSV reports, elapsed={time.perf_counter() - t_csv:.1f}s")
         if csv_paths:

@@ -1801,10 +1801,13 @@ def render_fused_solution_map(
             uav_path = np.asarray(route["uav_path"], dtype=float)
             if uav_path.ndim != 2 or uav_path.shape[0] < 2:
                 continue
-            if uav_path.shape[0] >= 3:
-                drone_line = pv.Spline(uav_path, n_points=80)
-            else:
-                drone_line = pv.Line(uav_path[0], uav_path[-1], resolution=1)
+            drone_line = pv.PolyData(uav_path)
+            drone_line.lines = np.hstack(
+                (
+                    [uav_path.shape[0]],
+                    np.arange(uav_path.shape[0], dtype=np.int64),
+                )
+            )
             plotter.add_mesh(
                 drone_line,
                 color=drone_color,
@@ -1812,12 +1815,26 @@ def render_fused_solution_map(
                 render_lines_as_tubes=True,
                 opacity=0.95,
             )
+            if uav_path.shape[0] > 2:
+                plotter.add_points(
+                    uav_path[1:-1],
+                    color=drone_color,
+                    point_size=10,
+                    render_points_as_spheres=True,
+                    opacity=0.98,
+                )
 
         if show_rider_paths:
             rider_path = np.asarray(route["rider_path"], dtype=float)
             if rider_path.ndim != 2 or rider_path.shape[0] < 2:
                 continue
-            rider_line = pv.Line(rider_path[0], rider_path[-1], resolution=1)
+            rider_line = pv.PolyData(rider_path)
+            rider_line.lines = np.hstack(
+                (
+                    [rider_path.shape[0]],
+                    np.arange(rider_path.shape[0], dtype=np.int64),
+                )
+            )
             plotter.add_mesh(
                 rider_line,
                 color=rider_color,
@@ -2813,6 +2830,7 @@ def export_fused_solution_csv_reports(
         arrive_h = float(plan.get("delivery_time_h", launch_h))
         uav_depart_h = float(plan.get("uav_depart_time_h", launch_h))
         uav_arrive_h = float(plan.get("uav_arrival_time_h", uav_depart_h))
+        is_on_time = "是" if arrive_h <= float(order.latest_time) + 1e-9 else "否"
 
         total_delivery_h = max(0.0, arrive_h - launch_h)
         uav_delivery_h = max(0.0, uav_arrive_h - uav_depart_h)
@@ -2838,6 +2856,7 @@ def export_fused_solution_csv_reports(
                 "直线距离": round(straight_distance_m, 4),
                 "订单发起时间": round(launch_h * 60.0, 4),
                 "到达时间": round(arrive_h * 60.0, 4),
+                "是否准时": is_on_time,
                 "总配送时间": round(total_delivery_h * 60.0, 4),
                 "无人机配送时间": round(uav_delivery_h * 60.0, 4),
                 "骑手配送时间": round(rider_delivery_h * 60.0, 4),
@@ -2855,6 +2874,7 @@ def export_fused_solution_csv_reports(
             "直线距离",
             "订单发起时间",
             "到达时间",
+            "是否准时",
             "总配送时间",
             "无人机配送时间",
             "骑手配送时间",
@@ -2882,7 +2902,7 @@ def build_orders_from_customers(
     random_seed: Optional[int] = None,
     demand_range: Tuple[float, float] = (0.5, 1.5),
     earliest_range: Tuple[float, float] = (0.0, 0.5),
-    window_width: float = 1.0,
+    window_width: Union[float, Tuple[float, float]] = (0.5, 1.0),
     service_time: float = 0.03,
 ) -> List[DeliveryOrder]:
     """从顾客样本构建订单集合（用于融合模型求解）。
@@ -2891,6 +2911,7 @@ def build_orders_from_customers(
         - 若顾客数据中缺少订单量/时间窗，本函数自动合成可复现实验订单。
         - 每个顾客默认生成 1 个订单。
         - 订单归属商家采用“最近商家”原则。
+        - 时间窗宽度默认随机采样于 [0.5, 1.0] 小时（即 30~60 分钟）。
     """
 
     if not merchants:
@@ -2918,6 +2939,18 @@ def build_orders_from_customers(
 
     low_demand, high_demand = demand_range
     early_low, early_high = earliest_range
+    if isinstance(window_width, (tuple, list)):
+        if len(window_width) != 2:
+            raise ValueError("window_width tuple/list must contain exactly two values: (min_h, max_h)")
+        win_low = float(window_width[0])
+        win_high = float(window_width[1])
+    else:
+        win_low = float(window_width)
+        win_high = float(window_width)
+    if win_low <= 0.0 or win_high <= 0.0:
+        raise ValueError("window_width must be positive")
+    if win_high < win_low:
+        win_low, win_high = win_high, win_low
 
     orders: List[DeliveryOrder] = []
     for k, idx in enumerate(indices):
@@ -2925,7 +2958,11 @@ def build_orders_from_customers(
         cx = float(c.get("x", 0.0))
         cy = float(c.get("y", 0.0))
         earliest = float(rng.uniform(early_low, early_high))
-        latest = earliest + float(window_width)
+        if win_high > win_low:
+            window_h = float(rng.uniform(win_low, win_high))
+        else:
+            window_h = float(win_low)
+        latest = earliest + window_h
         demand = float(rng.uniform(low_demand, high_demand))
         order_id = str(c.get("id", f"O{k}"))
 

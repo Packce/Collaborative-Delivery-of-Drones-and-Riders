@@ -1571,11 +1571,12 @@ def _extract_solution_routes(
     path_obstacle_buffer_m: float = 20.0,
     path_max_expand_nodes: int = 4000,
     path_max_waypoints: int = 8,
+    include_all_selected_uav_legs: bool = True,
 ) -> List[Dict[str, Any]]:
     """将最终规划结果转换为可绘制的无人机/骑手路径。"""
 
     routes: List[Dict[str, Any]] = []
-    if not solution.order_plan:
+    if not solution.order_plan and (not include_all_selected_uav_legs or not solution.selected_candidates):
         return routes
 
     lift = max(0.5, float(rider_ground_lift))
@@ -1583,8 +1584,86 @@ def _extract_solution_routes(
         terrain=terrain,
         obstacles=obstacles,
     )
-    # 渲染阶段按订单遍历时，同一商家->候选点航段可能重复出现，这里做缓存避免重复搜索。
+    # 缓存商家->候选点航段，避免重复搜索。
     uav_path_cache: Dict[Tuple[int, int], List[Tuple[float, float, float]]] = {}
+
+    def _resolve_uav_leg_path(
+        merchant_idx: int,
+        candidate_idx: int,
+        mx: float,
+        my: float,
+        mz: float,
+    ) -> List[Tuple[float, float, float]]:
+        cache_key = (int(merchant_idx), int(candidate_idx))
+        cached = uav_path_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        gx, gy = candidate_points[candidate_idx]
+        gx = float(gx)
+        gy = float(gy)
+        gz = terrain.get_elevation(gx, gy)
+
+        cruise_agl = _resolve_cruise_agl(
+            safe_clearance_height=float(safe_clearance_height),
+            min_flight_height=float(min_flight_height),
+            max_flight_height=float(max_flight_height),
+        )
+        cruise_ref = max(mz, gz) + cruise_agl
+
+        start = (mx, my, mz)
+        end = _point_with_agl(terrain, gx, gy, cruise_agl)
+        inner_points_raw = _search_uav_path_points(
+            calculator=search_calculator,
+            start=start,
+            end=end,
+            cruise=cruise_ref,
+            enable_multi_waypoint_search=bool(enable_multi_waypoint_search),
+            grid_step_m=float(path_grid_step_m),
+            search_margin_m=float(path_search_margin_m),
+            obstacle_buffer_m=float(path_obstacle_buffer_m),
+            max_expand_nodes=int(path_max_expand_nodes),
+            max_waypoints=int(path_max_waypoints),
+            keep_all_waypoints=True,
+        )
+        inner_points = [
+            _point_with_agl(terrain, px, py, cruise_agl)
+            for px, py, _ in inner_points_raw
+        ]
+        path = [start] + inner_points + [end]
+        uav_path_cache[cache_key] = path
+        return path
+
+    selected_candidates: List[int] = []
+    selected_seen = set()
+    for g in solution.selected_candidates:
+        gi = int(g)
+        if 0 <= gi < len(candidate_points) and gi not in selected_seen:
+            selected_seen.add(gi)
+            selected_candidates.append(gi)
+
+    rendered_uav_pairs = set()
+    # 先补全“每商家->每已选候选点”的无人机航段，满足路径图展示需求。
+    if include_all_selected_uav_legs:
+        for merchant_idx, merchant in enumerate(merchants):
+            mx = float(merchant.get("x", 0.0))
+            my = float(merchant.get("y", 0.0))
+            mz = terrain.get_elevation(mx, my)
+            for candidate_idx in selected_candidates:
+                uav_path = _resolve_uav_leg_path(merchant_idx, candidate_idx, mx, my, mz)
+                rendered_uav_pairs.add((merchant_idx, candidate_idx))
+                routes.append(
+                    {
+                        "order_index": -1,
+                        "drone_idx": merchant_idx,
+                        "rider_idx": -1,
+                        "candidate_idx": candidate_idx,
+                        "uav_path": uav_path,
+                        "rider_path": [],
+                    }
+                )
+
+    # 再叠加订单层面的骑手路径；若无人机航段已在上方绘制则不重复添加。
     for plan in solution.order_plan:
         merchant_idx = int(plan.get("merchant_idx", -1))
         customer_idx = int(plan.get("customer_idx", -1))
@@ -1616,37 +1695,8 @@ def _extract_solution_routes(
             gy = float(gy)
             gz = terrain.get_elevation(gx, gy)
 
-            cache_key = (merchant_idx, candidate_idx)
-            uav_path = uav_path_cache.get(cache_key)
-            if uav_path is None:
-                cruise_agl = _resolve_cruise_agl(
-                    safe_clearance_height=float(safe_clearance_height),
-                    min_flight_height=float(min_flight_height),
-                    max_flight_height=float(max_flight_height),
-                )
-                cruise_ref = max(mz, gz) + cruise_agl
-
-                start = (mx, my, mz)
-                end = _point_with_agl(terrain, gx, gy, cruise_agl)
-                inner_points_raw = _search_uav_path_points(
-                    calculator=search_calculator,
-                    start=start,
-                    end=end,
-                    cruise=cruise_ref,
-                    enable_multi_waypoint_search=bool(enable_multi_waypoint_search),
-                    grid_step_m=float(path_grid_step_m),
-                    search_margin_m=float(path_search_margin_m),
-                    obstacle_buffer_m=float(path_obstacle_buffer_m),
-                    max_expand_nodes=int(path_max_expand_nodes),
-                    max_waypoints=int(path_max_waypoints),
-                    keep_all_waypoints=True,
-                )
-                inner_points = [
-                    _point_with_agl(terrain, px, py, cruise_agl)
-                    for px, py, _ in inner_points_raw
-                ]
-                uav_path = [start] + inner_points + [end]
-                uav_path_cache[cache_key] = uav_path
+            if (merchant_idx, candidate_idx) not in rendered_uav_pairs:
+                uav_path = _resolve_uav_leg_path(merchant_idx, candidate_idx, mx, my, mz)
             rider_path = [(gx, gy, gz + lift), (cx, cy, cz + lift)]
         else:
             rider_path = [(mx, my, mz + lift), (cx, cy, cz + lift)]
@@ -1720,7 +1770,8 @@ def render_fused_solution_map(
 
     off_screen = bool(save_path) and not show
     plotter = pv.Plotter(off_screen=off_screen, window_size=window_size)
-
+    plotter.set_scale(zscale=3.0)
+    
     plotter.add_mesh(
         terrain_mesh,
         rgb=True,
@@ -1774,6 +1825,7 @@ def render_fused_solution_map(
         path_obstacle_buffer_m=path_obstacle_buffer_m,
         path_max_expand_nodes=path_max_expand_nodes,
         path_max_waypoints=path_max_waypoints,
+        include_all_selected_uav_legs=bool(show_uav_paths),
     )
 
     drone_palette = [

@@ -1015,10 +1015,10 @@ def main() -> None:
     project_root = Path(__file__).resolve().parents[1]
     merchant_csv = project_root / "数据" / "商家数据.csv"
     customer_csv = project_root / "数据" / "顾客数据.csv"
-    NSGA_OPTION = False #改进的NSGA-II算法使用开关
-    CLASSIC_GA_OPTION = False #经典遗传算法使用开关
+    NSGA_OPTION = True #改进的NSGA-II算法使用开关
+    CLASSIC_GA_OPTION = True #经典遗传算法使用开关
     CLASSIC_NSGA_OPTION = True #传统NSGA算法使用开关
-    PSO_OPTION = False #粒子群算法使用开关
+    PSO_OPTION = True #粒子群算法使用开关
 
     if (
         terrain_csv.exists()
@@ -1639,6 +1639,7 @@ def _extract_solution_routes(
                     obstacle_buffer_m=float(path_obstacle_buffer_m),
                     max_expand_nodes=int(path_max_expand_nodes),
                     max_waypoints=int(path_max_waypoints),
+                    keep_all_waypoints=True,
                 )
                 inner_points = [
                     _point_with_agl(terrain, px, py, cruise_agl)
@@ -1815,9 +1816,9 @@ def render_fused_solution_map(
                 render_lines_as_tubes=True,
                 opacity=0.95,
             )
-            if uav_path.shape[0] > 2:
+            if uav_path.shape[0] >= 2:
                 plotter.add_points(
-                    uav_path[1:-1],
+                    uav_path,
                     color=drone_color,
                     point_size=10,
                     render_points_as_spheres=True,
@@ -2358,8 +2359,14 @@ def _search_uav_path_points(
     obstacle_buffer_m: float,
     max_expand_nodes: int,
     max_waypoints: int,
+    keep_all_waypoints: bool = False,
 ) -> List[Tuple[float, float, float]]:
-    """从起点到终点搜索多拐点路径；失败时回退为单中点。"""
+    """从起点到终点搜索多拐点路径；失败时回退为单中点。
+
+    keep_all_waypoints:
+        为 True 时保留 A* 原始网格路径中的所有途径点（不做可视性裁剪和点数截断），
+        主要用于渲染展示；为 False 时保留原有简化逻辑。
+    """
 
     sx, sy, _ = start
     gx, gy, _ = end
@@ -2502,13 +2509,13 @@ def _search_uav_path_points(
 
     grid_points_xy = [(float(xs[ix]), float(ys[iy])) for ix, iy in path_idx]
     polyline_xy = [(float(sx), float(sy))] + grid_points_xy + [(float(gx), float(gy))]
-    simplified_xy = _visibility_simplify_polyline(polyline_xy, obstacles_xy)
-    inner_xy = simplified_xy[1:-1]
+    chosen_xy = polyline_xy if keep_all_waypoints else _visibility_simplify_polyline(polyline_xy, obstacles_xy)
+    inner_xy = chosen_xy[1:-1]
 
     if not inner_xy:
         return [mid_fallback]
 
-    if len(inner_xy) > max_wp:
+    if (not keep_all_waypoints) and len(inner_xy) > max_wp:
         select_idx = np.linspace(0, len(inner_xy) - 1, max_wp, dtype=int)
         inner_xy = [inner_xy[int(i)] for i in select_idx.tolist()]
 

@@ -18,6 +18,48 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
+MAX_DRONE_AGL_M = 120.0
+
+
+def _bounded_flight_height_limits(
+    min_flight_height: float,
+    max_flight_height: float,
+    hard_cap: float = MAX_DRONE_AGL_M,
+) -> Tuple[float, float]:
+    """返回合法的离地高度上下界（米）。"""
+
+    lower = max(0.0, float(min_flight_height))
+    upper = min(float(max_flight_height), float(hard_cap))
+    if upper < lower:
+        lower = upper
+    return float(lower), float(upper)
+
+
+def _resolve_cruise_agl(
+    safe_clearance_height: float,
+    min_flight_height: float,
+    max_flight_height: float,
+) -> float:
+    """基于配置计算巡航离地高度（米），并强制不超过 120m。"""
+
+    lower, upper = _bounded_flight_height_limits(min_flight_height, max_flight_height)
+    target = max(lower, float(safe_clearance_height))
+    return float(np.clip(target, lower, upper))
+
+
+def _point_with_agl(
+    terrain: "Terrain",
+    x: float,
+    y: float,
+    agl_height: float,
+) -> Tuple[float, float, float]:
+    """按“离地高度”构造三维点。"""
+
+    gx = float(x)
+    gy = float(y)
+    ground = terrain.get_elevation(gx, gy)
+    return gx, gy, float(ground + float(agl_height))
+
 
 @dataclass
 class Obstacle:
@@ -286,9 +328,9 @@ class UAVPathCostCalculator:
         """计算地形约束代价。
 
         规则:
-            - 若 H > 120，超高部分按 c_T 惩罚。
-            - 若 DH(x,y) < H <= 120，代价为 0。
-            - 若 H <= DH(x,y)，低于地形部分按 c_T 惩罚。
+            - 若离地高度 H-DH(x,y) > 120，超高部分按 c_T 惩罚。
+            - 若 0 <= H-DH(x,y) <= 120，代价为 0。
+            - 若 H < DH(x,y)，低于地形部分按 c_T 惩罚。
 
         参数:
             path: 路径点列表，每个点为 (x, y, H)
@@ -300,12 +342,13 @@ class UAVPathCostCalculator:
         total = 0.0
         for x, y, H in path:
             dh = self.terrain.get_elevation(x, y)
-            if H > 120.0:
-                cost = (H - 120.0) * self.c_T
-            elif dh < H <= 120.0:
+            agl = float(H - dh)
+            if agl > MAX_DRONE_AGL_M:
+                cost = (agl - MAX_DRONE_AGL_M) * self.c_T
+            elif agl >= 0.0:
                 cost = 0.0
             else:
-                cost = (dh - H) * self.c_T
+                cost = (-agl) * self.c_T
             total += cost
         return float(total)
 
@@ -986,10 +1029,10 @@ def main() -> None:
                 order_count=120,
                 random_seed=42,
                 config=cfg,
-                # render_plan=["uav", "rider"],
-                # render_save_path=str(plan_path),
-                # render_show=True,
-                # render_performance=True,
+                render_plan=["uav", "rider"],
+                render_save_path=str(plan_path),
+                render_show=True,
+                render_performance=True,
                 performance_save_dir=str(output_dir),
                 performance_show=False,
                 performance_file_prefix="nsga2_compare",
@@ -1258,6 +1301,23 @@ class FusionModelConfig:
     near_order_rider_only_distance_m: float = 1000.0
     rider_speed_cooperative_kmh: float = 30.0
     rider_speed_rider_only_kmh: float = 12.0
+    enforce_local_candidate_assignment: bool = True
+    local_candidate_distance_ratio: float = 2.0
+    local_candidate_extra_distance_m: float = 1200.0
+    local_candidate_penalty_coeff: float = 200.0
+
+    def __post_init__(self) -> None:
+        min_h, max_h = _bounded_flight_height_limits(
+            self.min_flight_height,
+            self.max_flight_height,
+        )
+        self.min_flight_height = float(min_h)
+        self.max_flight_height = float(max_h)
+        self.safe_clearance_height = float(np.clip(self.safe_clearance_height, min_h, max_h))
+
+        self.local_candidate_distance_ratio = max(1.0, float(self.local_candidate_distance_ratio))
+        self.local_candidate_extra_distance_m = max(0.0, float(self.local_candidate_extra_distance_m))
+        self.local_candidate_penalty_coeff = max(0.0, float(self.local_candidate_penalty_coeff))
 
 
 @dataclass
@@ -1417,16 +1477,20 @@ def _extract_solution_routes(
             cache_key = (merchant_idx, candidate_idx)
             uav_path = uav_path_cache.get(cache_key)
             if uav_path is None:
-                cruise = max(mz, gz) + float(safe_clearance_height)
-                cruise = float(np.clip(cruise, float(min_flight_height), float(max_flight_height)))
+                cruise_agl = _resolve_cruise_agl(
+                    safe_clearance_height=float(safe_clearance_height),
+                    min_flight_height=float(min_flight_height),
+                    max_flight_height=float(max_flight_height),
+                )
+                cruise_ref = max(mz, gz) + cruise_agl
 
                 start = (mx, my, mz)
-                end = (gx, gy, cruise)
-                inner_points = _search_uav_path_points(
+                end = _point_with_agl(terrain, gx, gy, cruise_agl)
+                inner_points_raw = _search_uav_path_points(
                     calculator=search_calculator,
                     start=start,
                     end=end,
-                    cruise=cruise,
+                    cruise=cruise_ref,
                     enable_multi_waypoint_search=bool(enable_multi_waypoint_search),
                     grid_step_m=float(path_grid_step_m),
                     search_margin_m=float(path_search_margin_m),
@@ -1434,6 +1498,10 @@ def _extract_solution_routes(
                     max_expand_nodes=int(path_max_expand_nodes),
                     max_waypoints=int(path_max_waypoints),
                 )
+                inner_points = [
+                    _point_with_agl(terrain, px, py, cruise_agl)
+                    for px, py, _ in inner_points_raw
+                ]
                 uav_path = [start] + inner_points + [end]
                 uav_path_cache[cache_key] = uav_path
             rider_path = [(gx, gy, gz + lift), (cx, cy, cz + lift)]
@@ -2291,16 +2359,20 @@ def _build_uav_leg_report(
     terrain = calculator.terrain
     mz = terrain.get_elevation(mx, my)
     gz = terrain.get_elevation(gx, gy)
-    cruise = max(mz, gz) + float(safe_clearance_height)
-    cruise = float(np.clip(cruise, float(min_flight_height), float(max_flight_height)))
+    cruise_agl = _resolve_cruise_agl(
+        safe_clearance_height=float(safe_clearance_height),
+        min_flight_height=float(min_flight_height),
+        max_flight_height=float(max_flight_height),
+    )
+    cruise_ref = max(mz, gz) + cruise_agl
 
     start = (mx, my, mz)
-    end = (gx, gy, cruise)
-    path = _search_uav_path_points(
+    end = _point_with_agl(terrain, gx, gy, cruise_agl)
+    path_raw = _search_uav_path_points(
         calculator=calculator,
         start=start,
         end=end,
-        cruise=cruise,
+        cruise=cruise_ref,
         enable_multi_waypoint_search=bool(enable_multi_waypoint_search),
         grid_step_m=float(path_grid_step_m),
         search_margin_m=float(path_search_margin_m),
@@ -2308,6 +2380,10 @@ def _build_uav_leg_report(
         max_expand_nodes=int(path_max_expand_nodes),
         max_waypoints=int(path_max_waypoints),
     )
+    path = [
+        _point_with_agl(terrain, px, py, cruise_agl)
+        for px, py, _ in path_raw
+    ]
 
     terrain_cost_value = float(calculator.terrain_cost(path))
     obstacle_cost_value, collision_count = calculator.obstacle_collision_detail(path, start, end)
@@ -2744,6 +2820,8 @@ class DroneRiderFusionOptimizer:
         self._uav_time: Optional[np.ndarray] = None
         self._uav_energy: Optional[np.ndarray] = None
         self._order_candidate_score: Optional[np.ndarray] = None
+        self._order_candidate_rider_distance: Optional[np.ndarray] = None
+        self._order_local_distance_limit: Optional[np.ndarray] = None
         self.last_performance_report: Optional[Dict[str, Any]] = None
         self._merchant_customer_distance_m = self._build_merchant_customer_distance_cache()
         self._rider_only_flags = self._build_rider_only_flags()
@@ -2834,16 +2912,20 @@ class DroneRiderFusionOptimizer:
         terrain = self.calculator.terrain
         mz = terrain.get_elevation(mx, my)
         gz = terrain.get_elevation(gx, gy)
-        cruise = max(mz, gz) + self.config.safe_clearance_height
-        cruise = float(np.clip(cruise, self.config.min_flight_height, self.config.max_flight_height))
+        cruise_agl = _resolve_cruise_agl(
+            safe_clearance_height=self.config.safe_clearance_height,
+            min_flight_height=self.config.min_flight_height,
+            max_flight_height=self.config.max_flight_height,
+        )
+        cruise_ref = max(mz, gz) + cruise_agl
 
         start = (mx, my, mz)
-        end = (gx, gy, cruise)
-        path = _search_uav_path_points(
+        end = _point_with_agl(terrain, gx, gy, cruise_agl)
+        path_raw = _search_uav_path_points(
             calculator=self.calculator,
             start=start,
             end=end,
-            cruise=cruise,
+            cruise=cruise_ref,
             enable_multi_waypoint_search=bool(self.config.enable_multi_waypoint_search),
             grid_step_m=float(self.config.path_grid_step_m),
             search_margin_m=float(self.config.path_search_margin_m),
@@ -2851,6 +2933,10 @@ class DroneRiderFusionOptimizer:
             max_expand_nodes=int(self.config.path_max_expand_nodes),
             max_waypoints=int(self.config.path_max_waypoints),
         )
+        path = [
+            _point_with_agl(terrain, px, py, cruise_agl)
+            for px, py, _ in path_raw
+        ]
 
         tc = self.calculator.terrain_cost(path)
         oc = self.calculator.obstacle_collision_cost(path, start, end)
@@ -2888,6 +2974,13 @@ class DroneRiderFusionOptimizer:
         no = len(self.orders)
         ng = len(self.candidate_points)
         score = np.zeros((no, ng), dtype=float)
+        rider_dist_matrix = np.zeros((no, ng), dtype=float)
+        local_limit = np.zeros(no, dtype=float)
+
+        ratio_limit = float(self.config.local_candidate_distance_ratio)
+        extra_limit = float(self.config.local_candidate_extra_distance_m)
+        locality_penalty_coeff = float(self.config.local_candidate_penalty_coeff)
+        enforce_local = bool(self.config.enforce_local_candidate_assignment)
 
         for oi, order in enumerate(self.orders):
             mi = int(order.merchant_idx)
@@ -2898,12 +2991,116 @@ class DroneRiderFusionOptimizer:
                 gx = float(gx)
                 gy = float(gy)
                 rider_dist = self._distance_2d(order.customer_x, order.customer_y, gx, gy)
-                score[oi, gi] = float(
+                rider_dist_matrix[oi, gi] = rider_dist
+
+            nearest_dist = float(np.min(rider_dist_matrix[oi, :])) if ng > 0 else 0.0
+            local_limit_oi = max(nearest_dist * ratio_limit, nearest_dist + extra_limit)
+            local_limit[oi] = float(local_limit_oi)
+
+            for gi in range(ng):
+                rider_dist = float(rider_dist_matrix[oi, gi])
+                value = float(
                     self.config.lambda_drone_cost * self._uav_cost[mi, gi]
                     + self.config.lambda_rider_cost * rider_dist
                 )
+                if enforce_local and rider_dist > local_limit_oi + 1e-9:
+                    overflow = rider_dist - local_limit_oi
+                    value += locality_penalty_coeff * overflow
+                score[oi, gi] = value
 
         self._order_candidate_score = score
+        self._order_candidate_rider_distance = rider_dist_matrix
+        self._order_local_distance_limit = local_limit
+
+    def _is_local_candidate_for_order(self, order_idx: int, candidate_idx: int) -> bool:
+        if not bool(self.config.enforce_local_candidate_assignment):
+            return True
+
+        if self._order_candidate_rider_distance is None or self._order_local_distance_limit is None:
+            self._build_order_candidate_score_matrix()
+        assert self._order_candidate_rider_distance is not None and self._order_local_distance_limit is not None
+
+        if order_idx < 0 or order_idx >= len(self.orders):
+            return False
+        if candidate_idx < 0 or candidate_idx >= len(self.candidate_points):
+            return False
+
+        rider_dist = float(self._order_candidate_rider_distance[order_idx, candidate_idx])
+        dist_limit = float(self._order_local_distance_limit[order_idx])
+        return rider_dist <= dist_limit + 1e-9
+
+    def _local_candidate_indices_for_order(self, order_idx: int) -> List[int]:
+        if order_idx < 0 or order_idx >= len(self.orders):
+            return []
+        if not bool(self.config.enforce_local_candidate_assignment):
+            return list(range(len(self.candidate_points)))
+
+        if self._order_candidate_rider_distance is None or self._order_local_distance_limit is None:
+            self._build_order_candidate_score_matrix()
+        assert self._order_candidate_rider_distance is not None and self._order_local_distance_limit is not None
+
+        dist_row = self._order_candidate_rider_distance[order_idx, :]
+        limit = float(self._order_local_distance_limit[order_idx])
+        return [
+            int(gi)
+            for gi in np.where(dist_row <= limit + 1e-9)[0].tolist()
+        ]
+
+    def _ensure_local_coverage_for_selected(
+        self,
+        selected_candidates: List[int],
+        drone_orders: List[int],
+        max_pick: int,
+    ) -> List[int]:
+        if not drone_orders:
+            return []
+        if not bool(self.config.enforce_local_candidate_assignment):
+            return sorted({int(g) for g in selected_candidates if 0 <= int(g) < len(self.candidate_points)})
+
+        if self._order_candidate_score is None:
+            self._build_order_candidate_score_matrix()
+        assert self._order_candidate_score is not None
+
+        ng = len(self.candidate_points)
+        selected_set = {int(g) for g in selected_candidates if 0 <= int(g) < ng}
+
+        for oi in drone_orders:
+            if any(self._is_local_candidate_for_order(oi, g) for g in selected_set):
+                continue
+
+            local_options = self._local_candidate_indices_for_order(oi)
+            if not local_options:
+                continue
+
+            best_local = min(local_options, key=lambda g: float(self._order_candidate_score[oi, g]))
+            if best_local in selected_set:
+                continue
+
+            if len(selected_set) < max_pick:
+                selected_set.add(best_local)
+                continue
+
+            if not selected_set:
+                selected_set.add(best_local)
+                continue
+
+            support = {g: 0 for g in selected_set}
+            for oj in drone_orders:
+                best_curr = min(support.keys(), key=lambda g: float(self._order_candidate_score[oj, g]))
+                support[best_curr] += 1
+
+            removable = [g for g, cnt in support.items() if cnt == 0]
+            if not removable:
+                continue
+
+            remove_g = max(
+                removable,
+                key=lambda g: float(np.mean(self._order_candidate_score[drone_orders, g])),
+            )
+            selected_set.remove(remove_g)
+            selected_set.add(best_local)
+
+        return sorted(selected_set)
 
     def select_candidates_greedy(self) -> List[int]:
         """按总成本下降幅度进行候选点贪心选择。"""
@@ -2956,6 +3153,7 @@ class DroneRiderFusionOptimizer:
 
         if not selected:
             selected = [int(np.argmin(np.mean(active_score, axis=0)))]
+        selected = self._ensure_local_coverage_for_selected(selected, drone_orders, max_pick)
         return selected
 
     def _assign_candidates(self, selected_candidates: List[int]) -> Tuple[List[int], Dict[int, float]]:
@@ -2977,9 +3175,15 @@ class DroneRiderFusionOptimizer:
 
             best_g = None
             best_score = float("inf")
-            fallback_g = selected_candidates[0] if selected_candidates else -1
+            local_selected = [g for g in selected_candidates if self._is_local_candidate_for_order(oi, g)]
+            candidate_pool = local_selected if local_selected else list(selected_candidates)
+            fallback_g = (
+                min(candidate_pool, key=lambda g: float(self._order_candidate_score[oi, g]))
+                if candidate_pool
+                else -1
+            )
 
-            for g in selected_candidates:
+            for g in candidate_pool:
                 s = float(self._order_candidate_score[oi, g])
                 if candidate_load[g] + order.demand <= self.config.candidate_capacity and s < best_score:
                     best_score = s
@@ -3325,6 +3529,7 @@ class DroneRiderFusionOptimizer:
         report["all_orders_have_drone"] = True
         report["all_orders_have_rider"] = all(r >= 0 for r in assigned_rider)
         report["candidate_activation_ok"] = True
+        report["local_candidate_assignment_ok"] = True
         report["rider_only_rule_ok"] = True
         report["candidate_capacity_ok"] = all(
             load <= self.config.candidate_capacity + 1e-9 for load in candidate_load.values()
@@ -3348,6 +3553,8 @@ class DroneRiderFusionOptimizer:
                 report["all_orders_have_drone"] = False
             if g not in selected_set:
                 report["candidate_activation_ok"] = False
+            if g >= 0 and not self._is_local_candidate_for_order(oi, g):
+                report["local_candidate_assignment_ok"] = False
             if order.demand > self.config.drone_capacity + 1e-9:
                 drone_capacity_ok = False
         report["drone_capacity_ok"] = drone_capacity_ok
@@ -3458,6 +3665,8 @@ class DroneRiderFusionOptimizer:
                     cv += 1.0
                 elif g not in selected_set:
                     cv += 1.0
+                elif not self._is_local_candidate_for_order(oi, g):
+                    cv += 1.0
                 if d < 0:
                     cv += 1.0
                 cv += max(0.0, float(order.demand - self.config.drone_capacity))
@@ -3539,6 +3748,8 @@ class DroneRiderFusionOptimizer:
                 key=lambda g: (-counts[g], float(active_mean[g])),
             )[:max_selected]
 
+        if has_drone_orders:
+            selected = self._ensure_local_coverage_for_selected(selected, drone_orders, max_selected)
         selected_set = set(selected)
 
         for oi in range(n_orders):
@@ -3549,8 +3760,10 @@ class DroneRiderFusionOptimizer:
                 best_g = int(np.argmin(self._order_candidate_score[oi, :]))
                 selected_set.add(best_g)
                 selected.append(best_g)
-            if assignment[oi] not in selected_set:
-                best_g = min(selected_set, key=lambda g: float(self._order_candidate_score[oi, g]))
+            local_selected = [g for g in selected_set if self._is_local_candidate_for_order(oi, g)]
+            candidate_pool = local_selected if local_selected else list(selected_set)
+            if assignment[oi] not in candidate_pool:
+                best_g = min(candidate_pool, key=lambda g: float(self._order_candidate_score[oi, g]))
                 assignment[oi] = int(best_g)
 
         candidate_load = self._candidate_load_from_assignment(assignment)
@@ -3571,6 +3784,9 @@ class DroneRiderFusionOptimizer:
                         t for t in selected
                         if t != g and candidate_load.get(t, 0.0) + demand <= cap + 1e-9
                     ]
+                    local_feasible_targets = [t for t in feasible_targets if self._is_local_candidate_for_order(oi, t)]
+                    if local_feasible_targets:
+                        feasible_targets = local_feasible_targets
                     if not feasible_targets:
                         continue
                     best_t = min(feasible_targets, key=lambda t: float(self._order_candidate_score[oi, t]))
